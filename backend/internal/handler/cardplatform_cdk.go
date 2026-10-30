@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -52,7 +54,20 @@ func writeCardErr(c *gin.Context, err error) {
 		})
 		return
 	}
-	c.JSON(http.StatusBadGateway, gin.H{"error": err.Error(), "upstream": true})
+	writeUpstreamTransportErr(c, "cardplatform", err)
+}
+
+// writeUpstreamTransportErr 处理访问卡台时的网络层错误（超时、连接失败等）。
+// Go 的 *url.Error 文本会带上完整上游 URL（如 Post "https://卡台域名/api/..."），
+// 不能下发给浏览器；原始错误只写日志，响应里给通用提示。
+func writeUpstreamTransportErr(c *gin.Context, scope string, err error) {
+	log.Printf("[%s] upstream request failed: %v", scope, err)
+	msg, code := "服务暂时不可用，请稍后重试", "upstream_unavailable"
+	var ne net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+		msg, code = "服务响应超时，请稍后重试", "upstream_timeout"
+	}
+	c.JSON(http.StatusBadGateway, gin.H{"error": msg, "error_code": code, "upstream": true})
 }
 
 // CardPlatformPlans GET /api/v1/admin/cardplatform/plans
@@ -1000,7 +1015,7 @@ func PublicCDKPreview(c *gin.Context) {
 	cli := cardplatform.NewFromSettings()
 	st, raw, err := cli.Preview(c.Request.Context(), code, deviceFrom(c))
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		writeUpstreamTransportErr(c, "cdk-preview", err)
 		return
 	}
 	// 成功时记下 code ↔ redemption_token，供后续绑定 session / 账单查卡密
@@ -1026,7 +1041,7 @@ func PublicCDKPreflight(c *gin.Context) {
 	cli := cardplatform.NewFromSettings()
 	st, raw, err := cli.Preflight(c.Request.Context(), body, deviceFrom(c))
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		writeUpstreamTransportErr(c, "cdk-preflight", err)
 		return
 	}
 	// 预检成功：把 credential.session 绑到卡密（账单页可凭卡密查）
@@ -1071,7 +1086,7 @@ func PublicCDKRedeem(c *gin.Context) {
 	cli := cardplatform.NewFromSettings()
 	st, raw, err := cli.Redeem(c.Request.Context(), body, deviceFrom(c))
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		writeUpstreamTransportErr(c, "cdk-redeem", err)
 		return
 	}
 	proxyPublicJSON(c, st, raw)
@@ -1087,7 +1102,7 @@ func PublicCDKResult(c *gin.Context) {
 	cli := cardplatform.NewFromSettings()
 	st, raw, err := cli.Result(c.Request.Context(), token, deviceFrom(c))
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		writeUpstreamTransportErr(c, "cdk-result", err)
 		return
 	}
 	// 卡健康观察（best-effort，不阻断用户）
@@ -1129,7 +1144,7 @@ func PublicCDKResultByCode(c *gin.Context) {
 	cli := cardplatform.NewFromSettings()
 	st, raw, err := cli.Result(c.Request.Context(), bind.RedemptionToken, deviceFrom(c))
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		writeUpstreamTransportErr(c, "cdk-result-by-code", err)
 		return
 	}
 	// 附带本站元信息，前端可恢复轮询 token
@@ -1261,11 +1276,12 @@ func PublicCDKPlans(c *gin.Context) {
 	}
 	plans, err := cli.GetPlans(c.Request.Context(), c.Query("product"))
 	if err != nil {
-		// 降级文档默认
+		// 降级文档默认（原始错误含上游地址，只进日志）
+		log.Printf("[cdk-plans] upstream request failed, using docs default: %v", err)
 		c.JSON(http.StatusOK, gin.H{
 			"version":  0,
 			"source":   "docs_default_fallback",
-			"error":    err.Error(),
+			"error":    "实时价格暂不可用，已显示参考价",
 			"plans":    docsDefaultPlans(),
 			"registry": docsDefaultRegistry(),
 			"note":     docsDefaultNote,
