@@ -22,7 +22,7 @@ import { onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import RedeemShell from './RedeemShell.vue'
 import { buildProgressView } from './progress'
-import { RX_FILL, RX_QUERY, api, cardFromQuery, errorText, extractCardInput, looksUsed, stashPreview } from './api'
+import { RX_FILL, RX_QUERY, api, cardFromQuery, ownPreview, errorText, extractCardInput, looksUsed, stashPreview } from './api'
 
 const route = useRoute()
 const router = useRouter()
@@ -48,6 +48,16 @@ async function check(card: string) {
   busy.value = true
   error.value = ''
   try {
+    // 自有卡密：不调卡台，直接去填写页；已开始兑换过的去看进度
+    const own = await ownPreview(card)
+    if (own) {
+      if (own.error) {
+        error.value = own.error
+        return
+      }
+      await router.replace({ path: own.started ? RX_QUERY : RX_FILL, query: { card } })
+      return
+    }
     const preview = await api('/api/v1/public/cdk/preview', { method: 'POST', body: JSON.stringify({ code: card }) })
     const body = preview.data?.data && typeof preview.data.data === 'object' ? preview.data.data : preview.data || {}
     const token = body.redemption_token || preview.data?.redemption_token || body.token || ''

@@ -48,7 +48,7 @@
         <template v-if="view.canResubmit">
           <strong>原卡密仍可使用</strong>
           <p>请确认账号状态正常后，用原卡密重新提交。如之前登录过期，请重新获取 Session。</p>
-          <router-link class="rx-btn is-wide" :to="{ path: RX_HOME, query: { card: card } }">重新提交充值</router-link>
+          <router-link class="rx-btn is-wide" :to="{ path: RX_FILL, query: { card: card, retry: '1' } }">重新提交充值</router-link>
         </template>
         <template v-else>
           <strong>本次充值未完成</strong>
@@ -89,7 +89,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import RedeemShell from './RedeemShell.vue'
-import { RX_HOME, RX_QUERY, api, cardFromQuery, rememberedPlan, errorText, extractCardInput, formatElapsed, recentlySubmitted } from './api'
+import { RX_HOME, RX_FILL, RX_QUERY, api, cardFromQuery, rememberedPlan, errorText, extractCardInput, formatElapsed, recentlySubmitted } from './api'
 import { planLabel } from '../../lib/plan'
 import { isGrokPlan } from '../../lib/grok'
 import { isXPremiumPlan } from '../../lib/x-premium'

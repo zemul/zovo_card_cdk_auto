@@ -150,3 +150,13 @@ export function formatElapsed(totalSeconds: number): string {
   const pad = (n: number) => String(n).padStart(2, '0')
   return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`
 }
+
+/**
+ * 是不是本站自有卡密（GPT… 开头，由本站后台发）。自有码兑换时由后端现场购买卡台码。
+ * 返回 null 表示不是自有码（走卡台码流程）；网络错误时也返回 null，交给卡台码流程兜底报错。
+ */
+export async function ownPreview(code: string): Promise<{ own: true; plan: string; started: boolean; error?: string } | null> {
+  const r = await api('/api/v1/public/own-cdk/preview', { method: 'POST', body: JSON.stringify({ code }) })
+  if (!r.data?.own) return null
+  return { own: true, plan: String(r.data.plan || ''), started: r.data.started === true, error: r.ok ? undefined : errorText(r.data, '卡密不可用') }
+}

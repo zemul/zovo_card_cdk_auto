@@ -151,6 +151,15 @@ func setupRoutes(r *gin.Engine) {
 			pubCDK.POST("/exchange", handler.PublicAgentCDKExchange)
 		}
 
+		// 自有卡密（fork）：兑换时现场购买卡台码，见 handler/own_cdk.go
+		ownCDK := api.Group("/public/own-cdk")
+		{
+			ownCDK.POST("/preview", handler.OwnCDKPreview)
+			ownCDK.POST("/check", handler.OwnCDKCheck)
+			ownCDK.POST("/recover", handler.OwnCDKRecover)
+			ownCDK.POST("/redeem", handler.OwnCDKRedeem)
+		}
+
 		// 卡密状态查询：是否已用 + 充值邮箱（不返回 token）
 		lookup := api.Group("/lookup")
 		{
@@ -198,6 +207,12 @@ func setupRoutes(r *gin.Engine) {
 			admin.POST("/cardplatform/cdks/batch-note", handler.CardPlatformBatchSetCDKNote)
 			admin.POST("/cardplatform/cdks/batch-clear-note", handler.CardPlatformBatchClearCDKNote)
 			admin.PUT("/cardplatform/cdks/:id/note", handler.CardPlatformSetCDKNote)
+
+			// 自有卡密（fork）
+			admin.GET("/own-cdks", handler.AdminOwnCDKList)
+			admin.POST("/own-cdks", handler.AdminOwnCDKCreate)
+			admin.POST("/own-cdks/status", handler.AdminOwnCDKSetStatus)
+			admin.POST("/own-cdks/note", handler.AdminOwnCDKSetNote)
 			admin.POST("/cardplatform/cdks/:id/disable", handler.CardPlatformDisableCDK)
 			admin.POST("/cardplatform/cdks/:id/enable", handler.CardPlatformEnableCDK)
 			admin.GET("/cardplatform/cdk-orders", handler.CardPlatformListCDKOrders)

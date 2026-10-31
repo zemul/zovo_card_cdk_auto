@@ -68,6 +68,7 @@
             <template v-if="account.activeUntil"><dt>套餐到期</dt><dd>{{ fmtTime(account.activeUntil) }}</dd></template>
           </dl>
 
+          <p v-if="account.delinquent" class="rx-alert is-warn" style="margin-top: 14px">该账号有未结清账单（欠费）。仍可兑换：卡台会先取消原订阅再重新开通，但成功率低于正常账号。</p>
           <p v-if="blockReason" class="rx-alert is-warn" style="margin-top: 14px">{{ blockReason }}</p>
           <div v-else-if="needsRecovery || recoveryPending" class="rx-alert is-warn" style="margin-top: 14px">
             <!-- 二次确认放在本弹窗里：站点全局确认框会被这个弹窗盖住 -->
@@ -92,7 +93,7 @@
           <div class="rx-dialog-actions">
             <button class="rx-btn is-secondary" type="button" :disabled="submitting" @click="closeConfirm">返回修改</button>
             <button class="rx-btn" type="button" :disabled="!canRedeem || submitting" @click="doRedeem">
-              <span v-if="submitting" class="rx-spin" aria-hidden="true" />{{ submitting ? '提交中…' : '确认提交' }}
+              <span v-if="submitting" class="rx-spin" aria-hidden="true" />{{ submitting ? (own ? '正在提交，约需 20 秒…' : '提交中…') : '确认提交' }}
             </button>
           </div>
         </div>
@@ -107,7 +108,7 @@ import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import RedeemShell from './RedeemShell.vue'
 import { buildProgressView } from './progress'
-import { RX_HOME, RX_QUERY, api, cardFromQuery, clearPreview, errorText, extractSession, looksUsed, markSubmitted, planFromPreview, stashPreview, takePreview } from './api'
+import { RX_HOME, RX_QUERY, api, cardFromQuery, ownPreview, clearPreview, errorText, extractSession, looksUsed, markSubmitted, planFromPreview, stashPreview, takePreview } from './api'
 import { planLabel, planSatisfied } from '../../lib/plan'
 import { grokCredential, isGrokPlan } from '../../lib/grok'
 import { isXPremiumPlan, xPremiumCredential } from '../../lib/x-premium'
@@ -140,7 +141,10 @@ const submitting = ref(false)
 const redeemError = ref('')
 const copied = ref(false)
 let clientRequestId = ''
-const account = ref({ email: '', currentPlan: '', activeUntil: '', hasActive: null as boolean | null })
+const account = ref({ email: '', currentPlan: '', activeUntil: '', canPurchaseAt: '', willRenew: null as boolean | null, hasActive: null as boolean | null, delinquent: false })
+/** 自有卡密：预检 / 兑换都走 /api/v1/public/own-cdk/*，由后端现场购买卡台码 */
+const own = ref(false)
+const ownChecked = ref(false)
 
 const plan = computed(() => planFromPreview(previewInfo.value))
 const kind = computed<'gpt' | 'grok' | 'x'>(() => {
@@ -170,11 +174,26 @@ const alreadySatisfied = computed(() => {
 })
 const canRedeem = computed(() => {
   if (blockReason.value || needsRecovery.value || recoveryPending.value) return false
+  if (own.value) return ownChecked.value
   return kind.value === 'grok' ? !!grokSession.value : !!preflightToken.value
 })
 
 // 改了凭证就作废上一次预检结果
-watch(sessionRaw, () => { preflightToken.value = ''; grokSession.value = '' })
+watch(sessionRaw, () => { preflightToken.value = ''; grokSession.value = ''; ownChecked.value = false })
+
+/** 账号已有该套餐：告诉用户什么时候能再充（与旧兑换页同一文案）。 */
+function alreadyActiveHint(): string {
+  const label = planLabel(plan.value)
+  const until = account.value.canPurchaseAt || account.value.activeUntil
+  if (until && account.value.willRenew === true) {
+    return `账号已有 ${label} 或更高套餐，当前周期至 ${fmtTime(until)} 并会自动续费。请先在 ChatGPT 取消自动续费，到期后再兑换。`
+  }
+  if (until && account.value.willRenew === false) {
+    return `账号已有 ${label} 或更高套餐，最早可在 ${fmtTime(until)} 后兑换。卡密仍可使用，到期后再来即可。`
+  }
+  if (until) return `账号已有 ${label} 或更高套餐，当前周期至 ${fmtTime(until)}，到期后再兑换。`
+  return `账号已有 ${label} 或更高套餐，暂不能重复充值。`
+}
 
 function fmtTime(v: string) {
   const d = new Date(v)
@@ -213,8 +232,12 @@ function applyPreflight(body: any) {
     email: String(body.email || body.account_email || ''),
     currentPlan: String(body.currentPlan || body.current_plan || body.plan || ''),
     activeUntil: String(body.subscription_active_until || ''),
+    canPurchaseAt: String(body.can_purchase_at || body.subscription_active_until || ''),
+    willRenew: typeof body.subscription_will_renew === 'boolean' ? body.subscription_will_renew : null,
     hasActive: typeof body.subscription_has_active === 'boolean' ? body.subscription_has_active : null,
+    delinquent: body.subscription_is_delinquent === true,
   }
+  // 与旧兑换页 needsSubscriptionRecovery 同一条件
   needsRecovery.value = body.subscription_recovery_required === true || body.subscription_is_delinquent === true
   if (kind.value !== 'grok') preflightToken.value = String(body.preflight_token || '')
 }
@@ -231,6 +254,10 @@ async function doPreflight(retried = false) {
   }
   busy.value = true
   try {
+    if (own.value) {
+      await ownCheck(cred)
+      return
+    }
     if (!token.value && !(await runPreview())) return
     const r = await api('/api/v1/public/cdk/preflight', {
       method: 'POST',
@@ -261,7 +288,7 @@ async function doPreflight(retried = false) {
     }
     // 宽限期账号订阅还「有效」，会被误判成已有套餐；先让用户处理宽限期（与旧页面一致）
     if (!blockReason.value && !needsRecovery.value && alreadySatisfied.value) {
-      blockReason.value = `该账号已有 ${planLabel(plan.value)} 或更高套餐，暂不能重复充值。`
+      blockReason.value = alreadyActiveHint()
     }
     clientRequestId = 'web-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now()
     redeemError.value = ''
@@ -272,7 +299,30 @@ async function doPreflight(retried = false) {
   }
 }
 
+/** 自有卡密的账号检查：后端调直充预检，不发码、不扣钱。 */
+async function ownCheck(cred: { mode: string; session: string }) {
+  const r = await api('/api/v1/public/own-cdk/check', { method: 'POST', body: JSON.stringify({ code: card.value, credential: cred }) })
+  if (!r.ok) {
+    error.value = errorText(r.data, '账号验证失败')
+    return
+  }
+  const body = r.data?.data && typeof r.data.data === 'object' ? r.data.data : r.data || {}
+  blockReason.value = String(body.blocking_reason || '')
+  recoveryPending.value = false
+  graceAsk.value = false
+  applyPreflight(body)
+  ownChecked.value = true
+  // 宽限期：和卡台码一样显示「取消原订阅并重新检测」，后端先买好卡台码再取消
+  if (!blockReason.value && !needsRecovery.value && alreadySatisfied.value) {
+    blockReason.value = alreadyActiveHint()
+  }
+  redeemError.value = ''
+  copied.value = false
+  confirmOpen.value = true
+}
+
 async function recoverSubscription() {
+  if (own.value) return ownRecover()
   if (recovering.value || !preflightToken.value) return
   const pf = preflightToken.value
   recovering.value = true
@@ -299,6 +349,36 @@ async function recoverSubscription() {
   }
 }
 
+/** 自有卡密的宽限期处理：后端先买卡台码（之后兑换继续用它），再调卡台取消原订阅。 */
+async function ownRecover() {
+  if (recovering.value) return
+  const cred = credential()
+  if (!cred) {
+    redeemError.value = '请粘贴完整 JSON（必须含 sessionToken）'
+    return
+  }
+  recovering.value = true
+  redeemError.value = ''
+  recoveryPending.value = true
+  try {
+    const r = await api('/api/v1/public/own-cdk/recover', { method: 'POST', body: JSON.stringify({ code: card.value, credential: cred, confirmed: true }) })
+    if (!r.ok) {
+      redeemError.value = errorText(r.data, t('grace.refreshFailed'))
+      return
+    }
+    const result = r.data?.data || r.data || {}
+    if (result.preflight) applyPreflight(result.preflight)
+    recoveryPending.value = result.status !== 'cleared'
+    if (!recoveryPending.value) needsRecovery.value = false
+    dialog.toast(t(recoveryPending.value ? 'grace.pending' : 'grace.done'), recoveryPending.value ? 'warn' : 'ok')
+  } catch {
+    redeemError.value = t('grace.refreshFailed')
+  } finally {
+    recovering.value = false
+    graceAsk.value = false
+  }
+}
+
 async function recheck() {
   confirmOpen.value = false
   await doPreflight()
@@ -309,6 +389,22 @@ async function doRedeem() {
   submitting.value = true
   redeemError.value = ''
   try {
+    if (own.value) {
+      const cred = credential()
+      if (!cred) {
+        redeemError.value = '请粘贴完整 JSON（必须含 sessionToken）'
+        return
+      }
+      // 后端要现场购买卡台码再兑换，通常 10–20 秒
+      const r = await api('/api/v1/public/own-cdk/redeem', { method: 'POST', body: JSON.stringify({ code: card.value, credential: cred }) })
+      if (!r.ok && r.status !== 202) {
+        redeemError.value = errorText(r.data, '提交失败，请稍后用同一张卡密重试')
+        return
+      }
+      markSubmitted(card.value)
+      await router.replace({ path: RX_QUERY, query: { card: card.value } })
+      return
+    }
     const body = kind.value === 'grok'
       ? { redemption_token: token.value, credential: { mode: 'session', session: grokSession.value }, client_request_id: clientRequestId }
       : { redemption_token: token.value, preflight_token: preflightToken.value, client_request_id: clientRequestId }
@@ -363,6 +459,19 @@ onMounted(async () => {
     return
   }
   document.title = '填写账号信息'
+  const o = await ownPreview(card.value)
+  if (o) {
+    // 已提交过的码去看进度；从失败页点「重新提交」带 retry=1，留在填写页（后端确认卡台码可再用才会重新兑换）
+    if (o.started && route.query.retry !== '1') {
+      await router.replace({ path: RX_QUERY, query: { card: card.value } })
+      return
+    }
+    own.value = true
+    previewInfo.value = { plan: o.plan }
+    if (o.error) error.value = o.error
+    loading.value = false
+    return
+  }
   const stash = takePreview(card.value)
   if (stash) {
     token.value = stash.token

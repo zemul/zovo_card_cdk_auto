@@ -81,6 +81,7 @@ const routes: RouteRecordRaw[] = [
     children: [
       { path: '', name: 'AdminDashboard', component: () => import('../views/admin/AdminDashboard.vue') },
       { path: 'cdkeys', name: 'CDKeyManagement', component: () => import('../views/admin/CDKeyManagement.vue') },
+      { path: 'own-cdks', name: 'OwnCDK', component: () => import('../views/admin/OwnCDK.vue') },
       { path: 'orders', name: 'OrderReconcile', component: () => import('../views/admin/OrderReconcile.vue') },
       { path: 'appearance', name: 'SiteAppearance', component: () => import('../views/admin/SiteAppearance.vue') },
       { path: 'integration', name: 'CardIntegration', component: () => import('../views/admin/CardIntegration.vue') },
