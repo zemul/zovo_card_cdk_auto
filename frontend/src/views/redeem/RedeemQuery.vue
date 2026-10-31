@@ -89,7 +89,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import RedeemShell from './RedeemShell.vue'
-import { RX_HOME, RX_QUERY, api, cardFromQuery, rememberedPlan, rememberedEmail, errorText, extractCardInput, formatElapsed, recentlySubmitted } from './api'
+import { RX_HOME, RX_QUERY, api, cardFromQuery, rememberedPlan, errorText, extractCardInput, formatElapsed, recentlySubmitted } from './api'
 import { planLabel } from '../../lib/plan'
 import { isGrokPlan } from '../../lib/grok'
 import { isXPremiumPlan } from '../../lib/x-premium'
@@ -137,6 +137,25 @@ function stopPolling() {
   pollTimer = null
 }
 
+// 卡台公开结果不带充值邮箱；用本站现成的 /api/v1/lookup/cdk（从兑换时保存的 Session 取邮箱）补上。
+// 该接口内部也会请求卡台，所以每张卡密只查一次，结果留在页面内存里。
+const emailCache = new Map<string, string>()
+const emailPending = new Set<string>()
+async function fillEmail(code: string, gen: number) {
+  if (emailCache.has(code) || emailPending.has(code)) return
+  emailPending.add(code)
+  try {
+    const r = await api('/api/v1/lookup/cdk?code=' + encodeURIComponent(code))
+    const email = r.ok ? String(r.data?.account_email || '').trim() : ''
+    emailCache.set(code, email)
+    if (email && gen === generation && card.value === code && view.value && !view.value.accountEmail) {
+      view.value = { ...view.value, accountEmail: email }
+    }
+  } finally {
+    emailPending.delete(code)
+  }
+}
+
 function schedule(ms: number, gen: number) {
   if (pollTimer) clearTimeout(pollTimer)
   pollTimer = setTimeout(() => { void load(gen) }, ms)
@@ -150,12 +169,13 @@ async function load(gen = generation) {
   loading.value = false
 
   const next = r.ok ? buildProgressView(r.data) : null
-  if (next && !next.accountEmail) next.accountEmail = rememberedEmail(card.value)
   if (next?.found) {
     failures = 0
     error.value = ''
     pendingSubmit.value = false
+    if (!next.accountEmail) next.accountEmail = emailCache.get(card.value) || ''
     view.value = next
+    if (!next.accountEmail) void fillEmail(card.value, gen)
     elapsedBase = { seconds: next.elapsedSeconds, at: Date.now() }
     elapsed.value = elapsedBase.seconds
     if (!next.terminal) {
