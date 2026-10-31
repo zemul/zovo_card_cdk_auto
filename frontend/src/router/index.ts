@@ -5,6 +5,11 @@ import { useAuthStore } from '../stores/auth'
 const OPS_BASE = '/ops'
 
 const routes: RouteRecordRaw[] = [
+  // 新版兑换前台（fork，测试中）：/v2 输卡密 → /v2/redeem 填信息 → /v2/query 看进度。
+  // 前缀定义在 views/redeem/api.ts 的 RX_BASE，改路径时两处一起改。
+  { path: '/v2', name: 'RedeemHome', component: () => import('../views/redeem/RedeemHome.vue') },
+  { path: '/v2/redeem', name: 'RedeemFill', component: () => import('../views/redeem/RedeemFill.vue') },
+  { path: '/v2/query', name: 'RedeemQuery', component: () => import('../views/redeem/RedeemQuery.vue') },
   {
     path: '/',
     name: 'Home',
