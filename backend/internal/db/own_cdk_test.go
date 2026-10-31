@@ -208,3 +208,46 @@ func TestSaveOwnRedeemAttempt(t *testing.T) {
 		t.Fatalf("got %+v", o)
 	}
 }
+
+// 换码：只换没买过卡台码的；旧码作废并记下新码；新码继承地区，档位可改。
+func TestReplaceOwnCDK(t *testing.T) {
+	openOwnTestDB(t)
+	codes, _ := CreateOwnCDKs("plus", "auto", "发给A", 2)
+	fresh, used := codes[0], codes[1]
+
+	newCode, err := ReplaceOwnCDK(fresh, "pro_5x", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	o, _ := GetOwnCDK(fresh)
+	if o.Status != OwnStatusDisabled || o.ReplacedBy != newCode {
+		t.Fatalf("old: %+v", o)
+	}
+	n, _ := GetOwnCDK(newCode)
+	if n == nil || n.Status != OwnStatusUnused || n.Plan != "pro_5x" || n.Region != "auto" || n.Note != "发给A" || n.Replaces != fresh {
+		t.Fatalf("new: %+v", n)
+	}
+	if n.Code[:6] != "GPT5X-" {
+		t.Fatalf("new code tag should follow new plan: %s", n.Code)
+	}
+	// 作废的旧码不能再换、不能再抢占
+	if _, err := ReplaceOwnCDK(fresh, "", ""); err == nil {
+		t.Fatal("disabled code must not be replaced again")
+	}
+	if ok, _ := ClaimOwnCDKForIssue(fresh, "plus", "PH", time.Minute); ok {
+		t.Fatal("replaced code must not be claimable")
+	}
+
+	// 已买过卡台码的不能换
+	_, _ = ClaimOwnCDKForIssue(used, "plus", "PH", time.Minute)
+	_ = MarkOwnCDKIssued(used, "GPPLUS-X", "plus", "PH", 1)
+	if _, err := ReplaceOwnCDK(used, "", ""); err == nil {
+		t.Fatal("code with a platform code must not be replaced")
+	}
+	// 正在购买中（issuing）的也不能换
+	more, _ := CreateOwnCDKs("plus", "PH", "", 1)
+	_, _ = ClaimOwnCDKForIssue(more[0], "plus", "PH", time.Minute)
+	if _, err := ReplaceOwnCDK(more[0], "", ""); err == nil {
+		t.Fatal("issuing code must not be replaced")
+	}
+}

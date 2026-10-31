@@ -316,21 +316,26 @@ func ensurePlatformCode(ctx context.Context, o *db.OwnCDK, sess string, forRecov
 	}
 	plan, region := o.PlatformPlan, o.PlatformRegion
 	if plan == "" || region == "" {
-		// 第一次：定档位和地区（Plus 有半价资格买 plus_half）。之后的重试一律用库里的，不再重新判断。
+		// 第一次：先用直充预检看账号（不扣钱），再定档位和地区（Plus 有半价资格买 plus_half）。
+		// 之后的重试一律用库里的，不再重新判断。
 		region = resolveOwnRegion(ctx, o.Region, o.Plan)
 		plan = o.Plan
-		if o.Plan == "plus" {
-			r, err := directPreflight(ctx, "plus", region, sess)
-			if err != nil {
-				return err
-			}
+		r, err := directPreflight(ctx, o.Plan, region, sess)
+		if err != nil {
+			return err
+		}
+		if !recovering {
 			// 宽限期账号的拦截原因就是「先处理原订阅」，走取消流程时不拦
-			if r.BlockingReason != "" && !recovering {
+			if r.BlockingReason != "" {
 				return &ownUserErr{http.StatusBadRequest, r.BlockingReason}
 			}
-			if r.HalfEligible {
-				plan = ownPlanHalf
+			// 账号已有该套餐或更高：不买码（买了也开不通，白花服务费）。卡密保持未使用，可换号或退换
+			if accountAlreadyHas(r, o.Plan) {
+				return &ownUserErr{http.StatusBadRequest, "该账号已有 " + planDisplay(o.Plan) + " 或更高套餐，这张卡密未使用。可换一个账号兑换，或联系发码方处理。"}
 			}
+		}
+		if o.Plan == "plus" && r.HalfEligible {
+			plan = ownPlanHalf
 		}
 	}
 	ok, err := db.ClaimOwnCDKForIssue(o.Code, plan, region, ownClaimStale)
@@ -369,6 +374,54 @@ func ensurePlatformCode(ctx context.Context, o *db.OwnCDK, sess string, forRecov
 	o.Status, o.PlatformCode, o.PlatformPlan, o.PlatformRegion, o.PlatformID = db.OwnStatusIssued, it.Code, plan, region, it.ID
 	o.RedemptionToken, o.PreflightToken, o.ClientRequestID = "", "", ""
 	return nil
+}
+
+// planRank 档位高低（与前端 lib/plan.ts planSatisfied 同一套：Plus < Pro 5x < Pro 20x < Pro 50x）。
+// Go 不在这条线上：它比 Plus 低，任何付费套餐都满足 Go。
+func planRank(p string) int {
+	p = strings.ToLower(strings.TrimSpace(p))
+	switch {
+	case p == "pro_50x" || strings.Contains(p, "promax"):
+		return 4
+	case p == "pro_5x" || strings.Contains(p, "prolite") || strings.Contains(p, "5x"):
+		return 2
+	case strings.Contains(p, "pro"):
+		return 3
+	case strings.Contains(p, "plus"):
+		return 1
+	case p == "go" || strings.Contains(p, "chatgptgo"):
+		return 0
+	}
+	return -1 // free / 未知
+}
+
+// accountAlreadyHas 账号当前套餐是否已满足所购档位（满足就不该买码）。
+// 预检明确说订阅不在有效期（has_active=false）时一律不算满足。
+func accountAlreadyHas(r ownCheckResult, ownPlan string) bool {
+	if r.HasActive != nil && !*r.HasActive {
+		return false
+	}
+	cur := planRank(r.CurrentPlan)
+	if cur < 0 {
+		return false
+	}
+	return cur >= planRank(ownPlan)
+}
+
+func planDisplay(p string) string {
+	switch p {
+	case "plus":
+		return "Plus"
+	case "pro_5x":
+		return "Pro 5x"
+	case "pro_20x":
+		return "Pro 20x"
+	case "pro_50x":
+		return "Pro 50x"
+	case "go":
+		return "Go"
+	}
+	return p
 }
 
 // ownUserErr 给用户看的错误（不含卡台地址）。
@@ -800,6 +853,36 @@ func AdminOwnCDKSetStatus(c *gin.Context) {
 	username, _ := u.(string)
 	db.WriteAudit(username, "own_cdk_status", fmt.Sprintf("disabled=%v n=%d", req.Disabled, n), c.ClientIP())
 	c.JSON(http.StatusOK, gin.H{"updated": n})
+}
+
+// AdminOwnCDKReplace POST /api/v1/admin/own-cdks/replace  {code, plan?, note?}
+// 换码：旧码作废、生成新码（档位可改）。只对还没买卡台码的码有效，没有任何成本。
+func AdminOwnCDKReplace(c *gin.Context) {
+	var req struct {
+		Code string `json:"code"`
+		Plan string `json:"plan"`
+		Note string `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Code) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请指定要换的卡密"})
+		return
+	}
+	// 和兑换互斥：兑换正在处理这张码时不让换
+	unlock, ok := tryLockOwn(strings.ToUpper(strings.TrimSpace(req.Code)))
+	if !ok {
+		c.JSON(http.StatusConflict, gin.H{"error": "这张卡密正在兑换中，不能换码"})
+		return
+	}
+	defer unlock()
+	newCode, err := db.ReplaceOwnCDK(req.Code, req.Plan, req.Note)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	u, _ := c.Get("username")
+	username, _ := u.(string)
+	db.WriteAudit(username, "own_cdk_replace", fmt.Sprintf("old=%s new=%s plan=%s", maskCode(req.Code), maskCode(newCode), req.Plan), c.ClientIP())
+	c.JSON(http.StatusOK, gin.H{"code": newCode})
 }
 
 // AdminOwnCDKSetNote POST /api/v1/admin/own-cdks/note  {ids, note}

@@ -12,6 +12,50 @@
         <button class="btn-secondary" :disabled="loading" @click="load">刷新</button>
       </div>
 
+      <!-- 各套餐最便宜的地区（与「自动」兑换时用同一份价格表） -->
+      <div class="card space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h2 class="text-lg font-semibold text-ink">各地区参考价</h2>
+          <div class="flex items-center gap-3 text-xs text-muted">
+            <span v-if="pricing.snapshot_date">价格日期 {{ pricing.snapshot_date }}<span v-if="pricing.stale" class="price-stale">（超过 72 小时未更新）</span></span>
+            <button class="btn-secondary !py-1" :disabled="pricingLoading" @click="loadPricing">刷新</button>
+          </div>
+        </div>
+        <p class="text-xs text-muted">OpenAI 免税标价，按当日参考汇率折合美元，不含换汇手续费；实际扣款以兑换时卡台报价为准。绿色为「自动」地区当前会选的。</p>
+        <div v-if="pricingError" class="text-sm text-muted">{{ pricingError }}</div>
+        <div v-else class="overflow-x-auto">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>套餐</th>
+                <th>「自动」会选</th>
+                <th v-for="r in PRICE_REGIONS" :key="r">{{ regionName(r) }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="pricingLoading && !pricing.plans.length"><td :colspan="PRICE_REGIONS.length + 2" class="py-6 text-center text-muted">加载中…</td></tr>
+              <tr v-for="p in pricing.plans" :key="p.plan">
+                <td class="whitespace-nowrap font-medium">{{ planName(p.plan) }}</td>
+                <td class="whitespace-nowrap">
+                  <span v-if="p.cheapest" class="pill pill-good">{{ regionName(p.cheapest) }}</span>
+                  <span v-else class="text-muted">无数据，用{{ regionName(pricing.fallback) }}</span>
+                </td>
+                <td v-for="r in PRICE_REGIONS" :key="r" class="whitespace-nowrap">
+                  <template v-if="cell(p, r)">
+                    <template v-if="cell(p, r)!.usable">
+                      <span :class="p.cheapest === r ? 'price-best' : 'text-ink'">${{ cell(p, r)!.usd.toFixed(2) }}</span>
+                      <span class="text-xs text-muted ml-1">{{ fmtLocal(cell(p, r)!) }}</span>
+                    </template>
+                    <span v-else class="text-muted text-xs">无标价</span>
+                  </template>
+                  <span v-else class="text-muted">—</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- 生成 -->
       <div class="card space-y-4">
         <h2 class="text-lg font-semibold text-ink">生成</h2>
@@ -37,7 +81,7 @@
             <input v-model="form.note" class="input w-full" placeholder="例如：发给谁、哪一批" />
           </label>
         </div>
-        <p v-if="form.region === 'auto'" class="text-xs text-muted">「自动」暂按菲律宾付款，接入价格表后会按当时最便宜的地区。</p>
+        <p v-if="form.region === 'auto'" class="text-xs text-muted">「自动」：兑换时按卡台价格表选当时折合美元最便宜的地区（只比较标价，不含换汇手续费；价格表取不到时用菲律宾）。</p>
         <div class="flex flex-wrap items-center gap-3">
           <button class="btn-primary" :disabled="creating" @click="create">{{ creating ? '生成中…' : '生成' }}</button>
           <template v-if="created.length">
@@ -93,6 +137,9 @@
                 <td class="font-mono whitespace-nowrap">
                   {{ it.code }}
                   <button class="text-xs text-muted ml-1" @click="copyLines([it.code])">复制</button>
+                  <button v-if="it.status === 'unused'" class="text-xs text-muted ml-1" @click="swap(it)">换码</button>
+                  <div v-if="it.replaced_by" class="text-xs text-muted">已换成 {{ it.replaced_by }}</div>
+                  <div v-if="it.replaces" class="text-xs text-muted">由 {{ it.replaces }} 换来</div>
                 </td>
                 <td class="whitespace-nowrap">{{ planName(it.plan) }}</td>
                 <td class="whitespace-nowrap">{{ regionName(it.region) }}</td>
@@ -137,6 +184,8 @@ interface OwnCDK {
   platform_plan?: string
   platform_region?: string
   spare_codes?: string
+  replaced_by?: string
+  replaces?: string
   note?: string
   created_at: string
 }
@@ -158,6 +207,41 @@ const REGIONS = [
 ]
 // 后台可见实际购买档位，所以这里保留 plus_half 的名字
 const PLAN_NAMES: Record<string, string> = { plus_half: 'Plus 半价', ...Object.fromEntries(PLANS.map((p) => [p.key, p.label])) }
+
+interface PriceRow { region: string; currency: string; amount: number; usd: number; usable: boolean }
+interface PricePlan { plan: string; cheapest: string; rows: PriceRow[] }
+const PRICE_REGIONS = ['PH', 'EG', 'CL', 'JP', 'US']
+const pricing = reactive<{ snapshot_date: string; stale: boolean; fallback: string; plans: PricePlan[] }>({ snapshot_date: '', stale: false, fallback: 'PH', plans: [] })
+const pricingLoading = ref(false)
+const pricingError = ref('')
+
+const cell = (p: PricePlan, region: string) => p.rows.find((r) => r.region === region)
+const fmtLocal = (r: PriceRow) => {
+  try {
+    return new Intl.NumberFormat('zh-CN', { style: 'currency', currency: r.currency, maximumFractionDigits: r.amount >= 1000 ? 0 : 2 }).format(r.amount)
+  } catch {
+    return `${r.amount} ${r.currency}`
+  }
+}
+
+async function loadPricing() {
+  pricingLoading.value = true
+  pricingError.value = ''
+  try {
+    const r = await authFetch('/api/v1/admin/own-cdks/pricing')
+    const d = await readJSON(r)
+    if (!r.ok) throw new Error(d.error || '加载失败')
+    pricing.snapshot_date = d.snapshot_date || ''
+    pricing.stale = !!d.stale
+    pricing.fallback = d.fallback || 'PH'
+    pricing.plans = d.plans || []
+    if (!pricing.plans.some((p) => p.rows.length)) pricingError.value = '暂时取不到价格表，「自动」地区会用菲律宾。'
+  } catch (e: any) {
+    pricingError.value = (e.message || '加载失败') + '，「自动」地区会用菲律宾。'
+  } finally {
+    pricingLoading.value = false
+  }
+}
 
 const form = reactive({ plan: 'plus', region: 'PH', count: 1, note: '' })
 const creating = ref(false)
@@ -269,6 +353,23 @@ async function setStatus(disabled: boolean) {
   void load()
 }
 
+/** 换码：旧码作废，生成一张新码（可换套餐）。只对还没开始兑换的码有效，不花钱。 */
+async function swap(it: OwnCDK) {
+  const options = PLANS.map((p) => ({ label: p.label, value: p.key, desc: p.key === it.plan ? '当前套餐' : '' }))
+  const plan = await dialog.select(`换码：${it.code} 会作废，并生成一张新码。新码用哪个套餐？`, options, { title: '换码' })
+  if (!plan) return
+  const r = await authFetch('/api/v1/admin/own-cdks/replace', { method: 'POST', body: JSON.stringify({ code: it.code, plan }) })
+  const d = await readJSON(r)
+  if (!r.ok) {
+    dialog.toast(d.error || '换码失败', 'err')
+    return
+  }
+  created.value = [d.code]
+  const ok = await copyToClipboard(d.code)
+  dialog.toast(`已生成新码${ok ? '并复制' : ''}：${d.code}`, 'ok')
+  void load()
+}
+
 async function setNote() {
   const note = await dialog.prompt('给选中的卡密设置备注（留空即清除）', { title: '改备注' })
   if (note === null || note === undefined) return
@@ -282,5 +383,13 @@ async function setNote() {
   void load()
 }
 
-onMounted(load)
+onMounted(() => {
+  void load()
+  void loadPricing()
+})
 </script>
+
+<style scoped>
+.price-best { color: var(--good); font-weight: 600; }
+.price-stale { color: var(--warn); }
+</style>

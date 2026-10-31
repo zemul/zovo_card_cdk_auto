@@ -158,3 +158,30 @@ func TestOrderFailedAndCDKStatus(t *testing.T) {
 		t.Fatal("no cdk_status → empty")
 	}
 }
+
+// 已有该套餐（或更高）的账号不能买卡台码：预检的 currentPlan 与旧页面同一套高低比较。
+func TestAccountAlreadyHas(t *testing.T) {
+	yes, no := true, false
+	cases := []struct {
+		current string
+		active  *bool
+		plan    string
+		want    bool
+	}{
+		{"pro", &yes, "plus", true}, // 实测：Pro 账号拿 Plus 码 → 已满足
+		{"plus", &yes, "plus", true},
+		{"plus", &yes, "pro_5x", false},   // 需要升级：不算满足（升级交给人工）
+		{"prolite", &yes, "pro_5x", true}, // 上游 Pro 5x 的叫法
+		{"pro", &yes, "pro_50x", false},
+		{"free", nil, "plus", false},
+		{"plus", &no, "plus", false}, // 订阅已过期
+		{"plus", &yes, "go", true},
+		{"", nil, "plus", false},
+	}
+	for _, c := range cases {
+		r := ownCheckResult{CurrentPlan: c.current, HasActive: c.active}
+		if got := accountAlreadyHas(r, c.plan); got != c.want {
+			t.Errorf("current=%q active=%v plan=%s: got %v want %v", c.current, c.active, c.plan, got, c.want)
+		}
+	}
+}

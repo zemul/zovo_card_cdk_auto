@@ -210,9 +210,11 @@ func setupRoutes(r *gin.Engine) {
 
 			// 自有卡密（fork）
 			admin.GET("/own-cdks", handler.AdminOwnCDKList)
+			admin.GET("/own-cdks/pricing", handler.AdminOwnCDKPricing)
 			admin.POST("/own-cdks", handler.AdminOwnCDKCreate)
 			admin.POST("/own-cdks/status", handler.AdminOwnCDKSetStatus)
 			admin.POST("/own-cdks/note", handler.AdminOwnCDKSetNote)
+			admin.POST("/own-cdks/replace", handler.AdminOwnCDKReplace)
 			admin.POST("/cardplatform/cdks/:id/disable", handler.CardPlatformDisableCDK)
 			admin.POST("/cardplatform/cdks/:id/enable", handler.CardPlatformEnableCDK)
 			admin.GET("/cardplatform/cdk-orders", handler.CardPlatformListCDKOrders)

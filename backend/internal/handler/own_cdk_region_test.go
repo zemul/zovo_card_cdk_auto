@@ -1,8 +1,13 @@
 package handler
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/tuzi/cdk-recharge-system/internal/cardplatform"
 )
 
@@ -46,6 +51,59 @@ func TestResolveOwnRegionFixed(t *testing.T) {
 	for in, want := range map[string]string{"jp": "JP", "EG": "EG", "": "PH", "TR": "PH"} {
 		if got := resolveOwnRegion(nil, in, "plus"); got != want {
 			t.Errorf("region %q → %q want %q", in, got, want)
+		}
+	}
+}
+
+// 后台价格表接口：用缓存里的价格，输出每档「自动」会选的地区，与 cheapestRegion 一致；无标价的排最后。
+func TestAdminOwnCDKPricing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ownPricingMu.Lock()
+	ownPricingCache, ownPricingAt, ownPricingSnap = pricingSnapshot, time.Now(), "2026-10-31"
+	ownPricingMu.Unlock()
+	t.Cleanup(func() {
+		ownPricingMu.Lock()
+		ownPricingCache, ownPricingAt, ownPricingSnap = nil, time.Time{}, ""
+		ownPricingMu.Unlock()
+	})
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/admin/own-cdks/pricing", nil)
+	AdminOwnCDKPricing(c)
+
+	var out struct {
+		SnapshotDate string `json:"snapshot_date"`
+		Plans        []struct {
+			Plan     string `json:"plan"`
+			Cheapest string `json:"cheapest"`
+			Rows     []struct {
+				Region string `json:"region"`
+				Usable bool   `json:"usable"`
+			} `json:"rows"`
+		} `json:"plans"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.SnapshotDate != "2026-10-31" || len(out.Plans) != 5 {
+		t.Fatalf("got %+v", out)
+	}
+	want := map[string]string{"plus": "PH", "pro_5x": "EG", "pro_20x": "PH", "pro_50x": "EG", "go": "EG"}
+	for _, p := range out.Plans {
+		if p.Cheapest != want[p.Plan] {
+			t.Errorf("%s cheapest=%q want %q", p.Plan, p.Cheapest, want[p.Plan])
+		}
+		for _, r := range p.Rows {
+			if r.Region == "TR" {
+				t.Errorf("%s: unsupported region must not be listed", p.Plan)
+			}
+		}
+		if p.Plan == "go" {
+			last := p.Rows[len(p.Rows)-1]
+			if last.Region != "PH" || last.Usable {
+				t.Errorf("go: PH has no price and must be listed last as unusable, got %+v", p.Rows)
+			}
 		}
 	}
 }

@@ -31,7 +31,7 @@ var OwnPlans = map[string]string{
 	"pro_50x": "50X",
 }
 
-// OwnRegions 卡台当前支持的付款地区，加 auto（按价格表自动选，阶段 2 生效前按 PH）。
+// OwnRegions 卡台当前支持的付款地区，加 auto（兑换时按价格表选最便宜的，见 handler/own_cdk_region.go）。
 var OwnRegions = map[string]bool{"PH": true, "US": true, "JP": true, "CL": true, "EG": true, "AUTO": true}
 
 const ownCodePrefix = "GPT"
@@ -51,6 +51,8 @@ type OwnCDK struct {
 	RedemptionToken string `json:"-"`
 	PreflightToken  string `json:"-"`
 	ClientRequestID string `json:"-"`
+	ReplacedBy      string `json:"replaced_by,omitempty"` // 已换成哪张新码
+	Replaces        string `json:"replaces,omitempty"`    // 是由哪张旧码换来的
 	Note            string `json:"note,omitempty"`
 	CreatedAt       string `json:"created_at"`
 	IssuedAt        string `json:"issued_at,omitempty"`
@@ -78,6 +80,8 @@ func ensureOwnCDKTable() error {
 			redemption_token TEXT NOT NULL DEFAULT '',
 			preflight_token TEXT NOT NULL DEFAULT '',
 			client_request_id TEXT NOT NULL DEFAULT '',
+			replaced_by TEXT NOT NULL DEFAULT '',
+			replaces TEXT NOT NULL DEFAULT '',
 			note TEXT NOT NULL DEFAULT '',
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			issued_at DATETIME,
@@ -86,7 +90,7 @@ func ensureOwnCDKTable() error {
 		if ownTableErr == nil {
 			_, ownTableErr = DB.Exec(`CREATE INDEX IF NOT EXISTS idx_own_cdk_status ON own_cdk_codes(status)`)
 		}
-		for _, col := range []string{"redemption_token", "preflight_token", "client_request_id"} {
+		for _, col := range []string{"redemption_token", "preflight_token", "client_request_id", "replaced_by", "replaces"} {
 			if ownTableErr != nil {
 				break
 			}
@@ -178,13 +182,14 @@ func CreateOwnCDKs(plan, region, note string, count int) ([]string, error) {
 }
 
 const ownCols = `id, code, plan, region, status, platform_code, platform_plan, platform_region, platform_id,
-	spare_codes, redemption_token, preflight_token, client_request_id, note, COALESCE(created_at,''), COALESCE(issued_at,'')`
+	spare_codes, redemption_token, preflight_token, client_request_id, replaced_by, replaces, note,
+	COALESCE(created_at,''), COALESCE(issued_at,'')`
 
 func scanOwn(row interface{ Scan(...any) error }) (*OwnCDK, error) {
 	var o OwnCDK
 	if err := row.Scan(&o.ID, &o.Code, &o.Plan, &o.Region, &o.Status, &o.PlatformCode, &o.PlatformPlan,
 		&o.PlatformRegion, &o.PlatformID, &o.SpareCodes, &o.RedemptionToken, &o.PreflightToken, &o.ClientRequestID,
-		&o.Note, &o.CreatedAt, &o.IssuedAt); err != nil {
+		&o.ReplacedBy, &o.Replaces, &o.Note, &o.CreatedAt, &o.IssuedAt); err != nil {
 		return nil, err
 	}
 	return &o, nil
@@ -331,6 +336,61 @@ func SetOwnCDKDisabled(ids []int64, disabled bool) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// ReplaceOwnCDK 换码：旧码作废（disabled），生成一张新码，档位可改，地区和备注沿用旧码（可覆盖）。
+// ★只允许还没买卡台码的旧码★（status = unused，platform_code 为空）：这种码没花过钱，换掉没有任何成本。
+// 已买过卡台码的码，钱已经花在那张卡台码上，换码要人工判断，这里拒绝。
+func ReplaceOwnCDK(oldCode, newPlan, note string) (string, error) {
+	if err := ensureOwnCDKTable(); err != nil {
+		return "", err
+	}
+	old, err := GetOwnCDK(oldCode)
+	if err != nil {
+		return "", err
+	}
+	if old == nil {
+		return "", errors.New("卡密不存在")
+	}
+	if old.Status != OwnStatusUnused || old.PlatformCode != "" {
+		return "", errors.New("这张卡密已开始兑换（已购买卡台码），不能直接换码")
+	}
+	plan := strings.ToLower(strings.TrimSpace(newPlan))
+	if plan == "" {
+		plan = old.Plan
+	}
+	if _, ok := OwnPlans[plan]; !ok {
+		return "", fmt.Errorf("不支持的套餐: %s", plan)
+	}
+	if strings.TrimSpace(note) == "" {
+		note = old.Note
+	}
+	newCode, err := NewOwnCode(plan)
+	if err != nil {
+		return "", err
+	}
+	tx, err := DB.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	// 条件更新：并发兑换刚抢占了这张码时这里不会生效（status 已不是 unused）
+	res, err := tx.Exec(`UPDATE own_cdk_codes SET status = ?, replaced_by = ? WHERE code = ? AND status = ? AND platform_code = ''`,
+		OwnStatusDisabled, newCode, old.Code, OwnStatusUnused)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return "", errors.New("这张卡密刚开始兑换，不能换码")
+	}
+	if _, err := tx.Exec(`INSERT INTO own_cdk_codes (code, plan, region, note, replaces) VALUES (?, ?, ?, ?, ?)`,
+		newCode, plan, old.Region, strings.TrimSpace(note), old.Code); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return newCode, nil
 }
 
 // SetOwnCDKNote 改备注。
