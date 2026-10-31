@@ -72,6 +72,34 @@
       </div>
     </section>
 
+    <!-- 换了浏览器：卡台不给进度，只显示本站记录的结果 -->
+    <section v-else-if="basic" class="rx-status" :class="'is-' + basicState" aria-live="polite">
+      <p v-if="basicProduct" class="rx-banner">充值产品：{{ basicProduct }}</p>
+      <p v-if="basic.account_email" class="rx-account">
+        充值账号：<strong>{{ basic.account_email }}</strong>
+        <button class="rx-copy" type="button" @click="copyText(basic.account_email)">{{ copied ? '已复制' : '复制' }}</button>
+      </p>
+      <div class="rx-status-top">
+        <div>
+          <p class="rx-eyebrow">当前状态</p>
+          <h2>{{ basicTitle }}</h2>
+        </div>
+      </div>
+      <p class="rx-message">{{ basicMessage }}</p>
+      <p v-if="basic.used_at" class="rx-message">完成时间：{{ basic.used_at }}</p>
+      <p class="rx-message" style="opacity: 0.7">详细进度只能在兑换时使用的浏览器中查看。</p>
+      <div v-if="basic.status === 'failed' || basic.status === 'unused'" class="rx-next">
+        <template v-if="basic.status === 'unused' || basic.can_resubmit">
+          <strong>{{ basic.status === 'unused' ? '卡密还没有使用' : '原卡密仍可使用' }}</strong>
+          <router-link class="rx-btn is-wide" :to="{ path: RX_FILL, query: { card: card, retry: '1' } }">去兑换</router-link>
+        </template>
+        <template v-else>
+          <strong>本次充值未完成</strong>
+          <p>卡密暂时不能重新使用，请联系发码方处理，不要重复付款。</p>
+        </template>
+      </div>
+    </section>
+
     <section v-else-if="pendingSubmit" class="rx-status" aria-live="polite">
       <div class="rx-status-top">
         <div>
@@ -113,6 +141,25 @@ const error = ref('')
 const copied = ref(false)
 const pendingSubmit = ref(false)
 const elapsed = ref(0)
+
+/** 本站记录的结果（/api/v1/lookup/cdk 的返回），卡台进度查不到时用 */
+interface BasicResult { status: string; can_resubmit?: boolean; account_email?: string; plan?: string; used_at?: string; message?: string }
+const basic = ref<BasicResult | null>(null)
+const basicState = computed(() => ({ used: 'success', failed: 'failed', processing: 'processing' } as Record<string, string>)[basic.value?.status || ''] || 'processing')
+const basicTitle = computed(() => ({ used: '充值成功', failed: '充值失败', processing: '处理中', unused: '未使用', disabled: '已停用', expired: '已过期' } as Record<string, string>)[basic.value?.status || ''] || '已提交')
+const basicMessage = computed(() => {
+  const b = basic.value
+  if (!b) return ''
+  if (b.status === 'used') return '这张卡密已充值成功。'
+  if (b.status === 'processing') return '订单正在处理中，稍后再查。'
+  return b.message || ''
+})
+const basicProduct = computed(() => {
+  const p = String(basic.value?.plan || '')
+  if (!p) return ''
+  const label = planLabel(p)
+  return isGrokPlan(p) || isXPremiumPlan(p) ? label : 'ChatGPT ' + label
+})
 
 let pollTimer: ReturnType<typeof setTimeout> | null = null
 let tickTimer: ReturnType<typeof setInterval> | null = null
@@ -195,13 +242,18 @@ async function load(gen = generation) {
       return
     }
     pendingSubmit.value = false
-    error.value = r.status === 404 ? '未找到这张卡密的兑换记录。请确认卡密正确；需在兑换时使用的同一浏览器中查询。' : errorText(r.data, '未找到这张卡密的兑换记录')
+    // 换了浏览器时卡台不认设备，进度查不到：改看本站记录
+    if (await loadBasic(gen)) return
+    if (gen !== generation) return
+    error.value = r.status === 404 ? '未找到这张卡密的兑换记录，请确认卡密正确。' : errorText(r.data, '未找到这张卡密的兑换记录')
     return
   }
 
-  // 其它 4xx（如换了浏览器导致设备不匹配）重试也不会变：停止轮询，显示原因
+  // 其它 4xx（如换了浏览器导致设备不匹配）重试也不会变：停止轮询，改看本站记录
   if (r.status >= 400 && r.status < 500 && r.status !== 429) {
-    if (!view.value) error.value = errorText(r.data, '暂时无法查询这张卡密，请在兑换时使用的浏览器中打开')
+    if (!view.value && !(await loadBasic(gen)) && gen === generation) {
+      error.value = errorText(r.data, '暂时无法查询这张卡密，请在兑换时使用的浏览器中打开')
+    }
     return
   }
 
@@ -211,11 +263,33 @@ async function load(gen = generation) {
   schedule(Math.min(15000, 3000 * 2 ** Math.min(failures - 1, 3)), gen)
 }
 
+/** 本站记录：自有码走 own-cdk/preview（with_result），卡台码走 lookup/cdk。查到返回 true。 */
+async function loadBasic(gen: number): Promise<boolean> {
+  const code = card.value
+  let res: BasicResult | null = null
+  const own = await api('/api/v1/public/own-cdk/preview', { method: 'POST', body: JSON.stringify({ code, with_result: true }) })
+  if (own.data?.own) {
+    if (!own.ok) {
+      if (gen === generation) error.value = errorText(own.data, '卡密不可用')
+      return true
+    }
+    res = own.data.result || { status: 'unused', plan: own.data.plan }
+  } else {
+    const r = await api('/api/v1/lookup/cdk?code=' + encodeURIComponent(code))
+    if (r.ok && r.data?.status && r.data.status !== 'unknown') res = r.data
+  }
+  if (gen !== generation || !res) return false
+  error.value = ''
+  basic.value = res
+  return true
+}
+
 function start(code: string) {
   stopPolling()
   card.value = code
   input.value = code
   view.value = null
+  basic.value = null
   error.value = ''
   copied.value = false
   failures = 0
@@ -234,6 +308,10 @@ async function submit() {
 
 async function copyEmail() {
   if (view.value?.accountEmail) copied.value = await copyToClipboard(view.value.accountEmail)
+}
+
+async function copyText(text?: string) {
+  if (text) copied.value = await copyToClipboard(text)
 }
 
 function onVisible() {

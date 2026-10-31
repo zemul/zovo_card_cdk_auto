@@ -99,7 +99,7 @@
           <select v-model="filter.status" class="input" @change="reload">
             <option value="">全部状态</option>
             <option value="unused">未使用</option>
-            <option value="issued">已兑换/处理中</option>
+            <option value="issued">已买卡台码</option>
             <option value="issuing">购买中</option>
             <option value="disabled">已停用</option>
           </select>
@@ -261,7 +261,7 @@ const selectedCodes = computed(() => list.value.filter((it) => selected.value.in
 
 const planName = (k?: string) => (k ? PLAN_NAMES[k] || k : '—')
 const regionName = (k: string) => REGIONS.find((r) => r.key.toLowerCase() === String(k).toLowerCase())?.label || k
-const statusName = (s: string) => ({ unused: '未使用', issuing: '购买中', issued: '已兑换/处理中', disabled: '已停用' }[s] || s)
+const statusName = (s: string) => ({ unused: '未使用', issuing: '购买中', issued: '已买卡台码', disabled: '已停用' }[s] || s)
 const statusClass = (s: string) => ({ unused: 'pill pill-good', issuing: 'pill pill-warn', issued: 'pill pill-info', disabled: 'pill' }[s] || 'pill')
 const fmt = (v: string) => (v ? new Date(v.replace(' ', 'T') + (v.includes('Z') ? '' : 'Z')).toLocaleString('zh-CN') : '—')
 

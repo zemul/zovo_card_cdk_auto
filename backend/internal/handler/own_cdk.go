@@ -180,8 +180,9 @@ func buyPlatformCode(ctx context.Context, ownCode, plan, region string) (*cardpl
 	if prefix == "" && len(it.Code) >= 14 {
 		prefix = it.Code[:14]
 	}
-	// 存进本站完整码缓存，但状态记 own_reserved：它已绑定给这张自有码，不能出现在「未使用」库存导出里被再卖一次
-	if err := db.SaveCardplatformCDKCodeWithStatus(it.ID, it.Code, prefix, it.Plan, it.FeeAmountMinor, "own_reserved", region); err != nil {
+	// 存进本站完整码库，状态与普通码一样（unused），之后随卡台同步更新。
+	// 靠下面的备注区分：导出未使用库存时，备注「自有卡密 … 专用」的码不要拿去卖。
+	if err := db.SaveCardplatformCDKCode(it.ID, it.Code, prefix, it.Plan, it.FeeAmountMinor, region); err != nil {
 		log.Printf("[own-cdk] save platform code failed id=%d: %v", it.ID, err)
 	}
 	_ = db.SetCardplatformCDKNote(it.ID, "自有卡密 "+maskCode(ownCode)+" 专用")
@@ -210,7 +211,8 @@ func publicPlan(plan string) string {
 // 是自有码返回 {own:true, plan}；不是返回 {own:false}，前端改走卡台码流程。
 func OwnCDKPreview(c *gin.Context) {
 	var req struct {
-		Code string `json:"code"`
+		Code       string `json:"code"`
+		WithResult bool   `json:"with_result"` // 查询页用：换了浏览器看不到卡台进度时，附带本站记录的结果
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Code) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请输入卡密"})
@@ -235,7 +237,54 @@ func OwnCDKPreview(c *gin.Context) {
 	if o.RedemptionToken != "" {
 		out["started"] = true
 	}
+	if req.WithResult && o.PlatformCode != "" {
+		out["result"] = ownLookupResult(c.Request.Context(), o, deviceFrom(c))
+	}
 	c.JSON(http.StatusOK, out)
+}
+
+// ownLookupResult 自有码的兑换结果（查询页换了浏览器时用）。
+// 卡台码状态用 API Key 按 ID 查（不受设备限制），邮箱取兑换时保存的 Session。
+// 返回时只给自有码、隐藏 plus_half，不把卡台码交给浏览器。
+func ownLookupResult(ctx context.Context, o *db.OwnCDK, device string) cdkLookupResult {
+	r := cdkLookupResult{CDKCode: o.Code, Plan: publicPlan(o.Plan)}
+	if bind, err := db.GetBindingByCDK(o.Code); err == nil && bind != nil {
+		r.AccountEmail = extractEmailFromSession(bind.SessionPayload)
+	}
+	st := ""
+	if o.PlatformID > 0 {
+		if m := refreshStoredCDKMetadata(ctx, []int64{o.PlatformID}); m != nil {
+			st = m[o.PlatformID].Status
+		}
+	}
+	if st == "" { // 卡台暂时查不到：退回本站通用查询
+		lr := lookupOneCDK(ctx, o.PlatformCode, device)
+		if r.AccountEmail == "" {
+			r.AccountEmail = lr.AccountEmail
+		}
+		r.Status, r.Used, r.CanResubmit, r.UsedAt, r.Message = lr.Status, lr.Used, lr.CanResubmit, lr.UsedAt, lr.Message
+		return r
+	}
+	return applyOwnCDKStatus(r, st, o.RedemptionToken != "")
+}
+
+// applyOwnCDKStatus 卡台码状态 → 查询页结果。started=已提交过兑换。
+func applyOwnCDKStatus(r cdkLookupResult, cdkStatus string, started bool) cdkLookupResult {
+	switch cdkStatus {
+	case "consumed", "used", "redeemed":
+		r.Status, r.Used, r.Message = "used", true, "卡密使用成功"
+	case "reserved", "review":
+		r.Status, r.Message = "processing", "卡密兑换处理中"
+	case "unused":
+		if started {
+			r.Status, r.CanResubmit, r.Message = "failed", true, "上一次充值未成功，卡密可以重新提交"
+		} else {
+			r.Status, r.Message = "unused", "卡密未使用"
+		}
+	default: // frozen / disabled 等
+		r.Status, r.Message = "failed", "本次充值未完成，卡密暂时不能重新使用，请联系发码方处理"
+	}
+	return r
 }
 
 type ownCredReq struct {

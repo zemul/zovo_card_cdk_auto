@@ -185,3 +185,25 @@ func TestAccountAlreadyHas(t *testing.T) {
 		}
 	}
 }
+
+func TestApplyOwnCDKStatus(t *testing.T) {
+	cases := []struct {
+		st      string
+		started bool
+		want    string
+		resub   bool
+	}{
+		{"consumed", true, "used", false},
+		{"reserved", true, "processing", false},
+		{"review", true, "processing", false},
+		{"unused", true, "failed", true},
+		{"unused", false, "unused", false},
+		{"frozen", true, "failed", false},
+	}
+	for _, c := range cases {
+		r := applyOwnCDKStatus(cdkLookupResult{}, c.st, c.started)
+		if r.Status != c.want || r.CanResubmit != c.resub {
+			t.Errorf("%s started=%v → %s/%v want %s/%v", c.st, c.started, r.Status, r.CanResubmit, c.want, c.resub)
+		}
+	}
+}
