@@ -25,6 +25,40 @@ describe('buildProgressView', () => {
     expect(v.invoiceUrl).toBe('https://invoice.stripe.com/i/x')
   })
 
+  it('成功后追加的事件不拉长耗时', () => {
+    const v = buildProgressView({
+      data: {
+        order: { status: 'completed', created_at: '2026-10-31T14:53:35Z' },
+        events: [
+          { step: 'queued', created_at: '2026-10-31T14:53:35Z' },
+          { step: 'completed', to_status: 'completed', created_at: '2026-10-31T14:54:08Z' },
+          { step: 'renewal', created_at: '2026-10-31T14:54:50Z', public_message: '自动续费已取消' },
+          { step: 'reconcile', created_at: '2026-10-31T14:55:20Z' },
+        ],
+      },
+    })
+    expect(v.elapsedSeconds).toBe(33)
+  })
+
+  it('completed_at 为 Unix 秒时也能用', () => {
+    const v = buildProgressView({
+      order: { status: 'completed', created_at: '2026-10-31T14:53:35Z', completed_at: Date.parse('2026-10-31T14:54:08Z') / 1000 },
+      events: [{ step: 'renewal', created_at: '2026-10-31T14:56:00Z' }],
+    })
+    expect(v.elapsedSeconds).toBe(33)
+  })
+
+  it('失败单的耗时停在失败那一刻', () => {
+    const v = buildProgressView({
+      order: { status: 'failed', cdk_status: 'unused', created_at: '2026-10-26T12:00:00Z' },
+      events: [
+        { step: 'payment', category: 'failed', created_at: '2026-10-26T12:06:52Z', public_message: '支付失败' },
+        { step: 'reconcile', created_at: '2026-10-26T12:20:00Z' },
+      ],
+    })
+    expect(v.elapsedSeconds).toBe(412)
+  })
+
   it('重新进入支付队列时进度不倒退', () => {
     const v = buildProgressView(
       { data: { order: { status: 'awaiting_card', stage: 'cdk_accepted', created_at: '2026-10-26T11:58:15Z' }, events: [{ step: 'payment' }] } },

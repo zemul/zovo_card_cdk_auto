@@ -61,8 +61,15 @@ function stageStep(stage: string): number {
 const str = (v: unknown) => (v === null || v === undefined ? '' : String(v).trim())
 const first = (...vals: unknown[]) => vals.map(str).find((v) => v && v !== 'null') || ''
 
+/** 时间戳转毫秒：兼容 ISO 字符串、Unix 秒、Unix 毫秒（卡台 webhook 的 completed_at 是 Unix 秒）。 */
 function time(v: unknown): number {
-  const t = Date.parse(str(v))
+  const s = str(v)
+  if (!s || s === 'null') return 0
+  if (/^\d{9,13}$/.test(s)) {
+    const n = Number(s)
+    return s.length <= 10 ? n * 1000 : n
+  }
+  const t = Date.parse(s)
   return Number.isFinite(t) ? t : 0
 }
 
@@ -93,6 +100,17 @@ function failureReason(order: any, events: any[]): string {
 
 function steps(active: number, allDone: boolean): ProgressStep[] {
   return STEP_TEXTS.map((text, i) => ({ text, state: allDone || i < active ? 'done' : i === active ? 'active' : 'todo' }))
+}
+
+/** 第一条把订单带进终态的事件时间（成功看 completed，失败看失败类事件）。 */
+function terminalEventTime(events: any[], status: string): number {
+  const hit = events.find((e) => {
+    const to = str(e.to_status).toLowerCase()
+    if (status === 'completed') return to === 'completed' || str(e.step).toLowerCase() === 'completed'
+    const cat = str(e.category).toLowerCase()
+    return FAILED.has(to) || cat === 'failed' || cat === 'error'
+  })
+  return hit ? time(hit.created_at) : 0
 }
 
 /** 去掉句末标点再接下一句，避免出现「。。」 */
@@ -148,11 +166,14 @@ export function buildProgressView(payload: any, now = Date.now()): ProgressView 
     v.message = v.waitingForCard ? '正在等待可用支付资源，准备好后会自动继续。' : `正在${STEP_VERB[idx]}，请保持页面打开。`
   }
 
-  // 计时：从订单创建算起；结束态停在完成时间 / 最后一条事件 / 最后更新。
+  // 计时：从订单创建算起，结束态停在「订单进入终态」的那一刻。
+  // ★不能用最后一条事件★：成功后卡台还会追加取消自动续费、对账等事件，
+  // 刷新页面时耗时会被拉长（实测 33 秒的单刷新后显示 1 分多钟）。
   const start = time(order.created_at) || (events.length ? time(events[0].created_at) : 0)
   let end = now
   if (v.terminal) {
-    end = time(order.completed_at) || time(order.finished_at) || (events.length ? time(events[events.length - 1].created_at) : 0) || time(order.updated_at)
+    end = time(order.completed_at) || time(order.finished_at) || terminalEventTime(events, status) ||
+      (events.length ? time(events[events.length - 1].created_at) : 0) || time(order.updated_at)
   } else {
     v.running = true
   }
