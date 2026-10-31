@@ -89,7 +89,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import RedeemShell from './RedeemShell.vue'
-import { RX_HOME, RX_QUERY, api, cardFromQuery, rememberedPlan, errorText, extractCardInput, formatElapsed, recentlySubmitted } from './api'
+import { RX_HOME, RX_QUERY, api, cardFromQuery, rememberedPlan, rememberedEmail, errorText, extractCardInput, formatElapsed, recentlySubmitted } from './api'
 import { planLabel } from '../../lib/plan'
 import { isGrokPlan } from '../../lib/grok'
 import { isXPremiumPlan } from '../../lib/x-premium'
@@ -150,6 +150,7 @@ async function load(gen = generation) {
   loading.value = false
 
   const next = r.ok ? buildProgressView(r.data) : null
+  if (next && !next.accountEmail) next.accountEmail = rememberedEmail(card.value)
   if (next?.found) {
     failures = 0
     error.value = ''

@@ -107,7 +107,7 @@ import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import RedeemShell from './RedeemShell.vue'
 import { buildProgressView } from './progress'
-import { RX_HOME, RX_QUERY, api, cardFromQuery, clearPreview, errorText, extractSession, looksUsed, markSubmitted, planFromPreview, stashPreview, takePreview } from './api'
+import { RX_HOME, RX_QUERY, api, cardFromQuery, clearPreview, rememberEmail, errorText, extractSession, looksUsed, markSubmitted, planFromPreview, stashPreview, takePreview } from './api'
 import { planLabel, planSatisfied } from '../../lib/plan'
 import { grokCredential, isGrokPlan } from '../../lib/grok'
 import { isXPremiumPlan, xPremiumCredential } from '../../lib/x-premium'
@@ -318,6 +318,7 @@ async function doRedeem() {
       return
     }
     markSubmitted(card.value)
+    rememberEmail(card.value, account.value.email)
     clearPreview(card.value)
     await router.replace({ path: RX_QUERY, query: { card: card.value } })
   } finally {

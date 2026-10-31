@@ -85,6 +85,15 @@ export function rememberedPlan(code: string): string {
   try { return localStorage.getItem(PLAN_PREFIX + code) || '' } catch { return '' }
 }
 
+/** 进度页「充值账号」：卡台公开结果不带邮箱，用本浏览器预检时看到的（与旧兑换页同一做法）。 */
+const EMAIL_PREFIX = 'rx_email:'
+export function rememberEmail(code: string, email: string) {
+  try { if (email) localStorage.setItem(EMAIL_PREFIX + code, email) } catch { /* ignore */ }
+}
+export function rememberedEmail(code: string): string {
+  try { return localStorage.getItem(EMAIL_PREFIX + code) || '' } catch { return '' }
+}
+
 export function takePreview(code: string): { token: string; info: any } | null {
   try {
     const raw = sessionStorage.getItem(PREVIEW_PREFIX + code)
