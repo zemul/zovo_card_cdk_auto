@@ -1,17 +1,201 @@
-# ZovoCard · CDK 卡密系統接入文檔
+# ZovoCard · CDK 卡密分销 API 文档
 
-更新：2026-09-24。與客戶《開放 API 文檔》CDK 章節同步。通用鑑權、套餐、用卡規則及 Webhook 請見該文檔 §2、§6.18.2、§6.18.5a、§7。
+通过开放 API 程序化完成开卡、查卡、卡充值、退款、冻结、消费查询等操作。所有调用按你的账户余额与专属费率计费（与网页端一致）。
 
-- 所有者 API：`https://zovocard.com/openapi/v1`，服務端使用 `X-API-Key`。
-- 公開兌換：`https://zovocard.com/api/v1/cdk`，憑碼/令牌且綁定出口 IP/設備。
-- 自託管站：你自己的域名，路徑見 §6.20。三組地址不可混用。
-- 沙盒僅用 `https://sandbox.zovocard.com`、沙盒密鑰與測試資料。
+- **生产 Base URL**：`https://zovocard.com/openapi/v1`
+- **沙盒 Base URL**：`https://sandbox.zovocard.com/openapi/v1`
+- **数据格式**：请求与响应均为 `application/json`，UTF-8
+- **凭证获取**：登录后在「开发者」页生成 `app_id` / `app_secret`
 
-#### 6.18.6 發放和查詢 CDK
+### 代理接入前测试
+
+新代理应先登录 `https://sandbox.zovocard.com`，在「开发者」页创建一套仅用于沙盒的 API 密钥，再用沙盒 Base URL 完成联调。沙盒账户、密钥和数据与生产完全隔离；开卡、充值、退款及交易均为模拟结果，不会请求真实发卡渠道或产生真实资金变动。
+
+```bash
+export ZOVOCARD_API_BASE='https://sandbox.zovocard.com/openapi/v1'
+export ZOVOCARD_API_KEY='sk_沙盒密钥'
+
+curl "$ZOVOCARD_API_BASE/products" \
+  -H "X-API-Key: $ZOVOCARD_API_KEY"
+curl "$ZOVOCARD_API_BASE/balance" \
+  -H "X-API-Key: $ZOVOCARD_API_KEY"
+```
+
+沙盒验证通过后，只需改用生产 Base URL 和单独创建的生产密钥。不要在沙盒中使用生产密钥，也不要把沙盒返回的卡片或交易当作真实资产。
+
+## 0. 当前账户与卡片约束
+
+- 链上充值单笔最低 `50U`（USDT/USDC）；共享 TRC20 意向低于 `50U` 无法创建，专属地址收到低于 `50U` 的转账不会自动入账，会进入人工处理。
+- 普通账户全账户共同保留一笔 `20U` 风险保证金，不按卡片或交易重复扣取。该金额仍包含在 `balance` 中，不产生单独扣款流水；`GET /balance` 同时返回 `balance`、`spendable_balance` 和 `account_reserve_amount`，开卡、卡充值、批量开卡、转账、商城和 GPT 直充等用户主动消费只能使用 `spendable_balance`。
+- 子账户不单独保留 `20U`；主账户及其全部子账户共享主账户的保证金、拒付率、退款率、单日拒付计数和白名单资格。子账户风险手续费优先扣子账户余额，不足部分由主账户代扣，并分别记录资金流水；主账户风险保证金可用于核销该类手续费。子账户的 `account_reserve_amount` 和 `spendable_balance` 按其自身余额返回，不代表另行占用一笔保证金。
+- 拒付费、授权撤销费、消费退款费、小额消费费和受限商户处理费属于平台风险费用，可以核销保证金；调用方不要用总余额自行判断用户操作是否可执行。
+- 拒付规则：非白名单真实拒付前 3 笔免费，第 4 笔起基础 `$0.30`，比例档位附加 `$0.30/$0.50/$0.80`；所有账户授权撤销固定按金额 `1%` 收取，且不参与当前拒付/退款风控；消费退款金额低于 `1U` 时免收退款手续费，达到 `1U` 后继续执行比例与最低 `$0.50` 规则；Google 商户低于 `1U` 的消费验证退款不计入退款笔数、退款率分母或退款率，但保留完整流水；小额真实消费（`0 < amount < 0.50U`）每笔 `$0.30`。
+- 产品和卡详情返回 `restricted_merchants` 有效禁用商户数组，以及兼容字段 `google_chatgpt_blocked`。未配置卡头时，非香港发行卡默认禁用 `GOOGLE CHATGPT`，香港发行卡默认无禁用商户；产品管理可按前 6 位卡头配置多个商户，显式空数组表示全部放行。命中任一规则的真实授权/清算时，第一次冻结卡，第二次删卡、退回卡内余额并收取 `$0.50`，按 `auth_id + rule` 幂等。
+- 提现若触及最后 `20U`，属于保证金退出，必须删除全部卡片并等待 `30` 天观察期；30 天前管理端打款接口也会拒绝，不能只依赖前端按钮状态。
+
+---
+
+## 1. 接入流程
+
+1. 在「开发者」页生成密钥，得到 `app_id`（`ak_` 开头，公开标识）与 `app_secret`（`sk_` 开头，请求鉴权用，务必保密）。
+2. （可选）为密钥设置 IP 白名单、配置回调地址。
+3. 调 `GET /products` 获取可开卡产品 → `POST /cards/open` 开卡（建议带幂等键）。
+4. 用 `GET /cards/{id}` 取卡号/有效期/CVV，`GET /cards/{id}/transactions` 查消费，或配置 Webhook 实时接收卡事件。
+5. `GET /balance` 查余额，`GET /balance-logs` 对账。
+
+> 余额不足会导致开卡/充值失败。可在网页端用 USDT 充值，或用开放 API 充值（见 6.16b）：转账后贴交易哈希即可**提速到账**。API 充值支持 EVM 专属地址 `BSC` / `ERC20` / `X Layer`；TRON 请走网页端共享地址意向。
+
+---
+
+## 2. 鉴权
+
+每个请求在 Header 携带 `app_secret`（`sk_` 开头），二选一：
+
+```
+X-API-Key: sk_xxxxxxxxxxxxxxxx
+```
+或
+```
+Authorization: Bearer sk_xxxxxxxxxxxxxxxx
+```
+
+可选：再带 `X-App-Id: ak_xxxx` 做双重校验。
+
+- 密钥可在开发者页 **启用 / 停用**、设置 **IP 白名单**（仅允许指定 IP 调用）。
+- 鉴权失败返回 `401`；IP 不在白名单返回 `403`。
+
+---
+
+## 3. 请求与响应格式
+
+统一信封（注意字段名是 **`msg`**，不是 `message`）：
+
+```jsonc
+// 成功
+{ "code": 0, "msg": "ok", "data": <结果> }
+// 失败（多数错误带 error_code）
+{ "code": 400, "error_code": "insufficient_balance", "msg": "余额不足" }
+```
+
+**★HTTP 状态码是有意义的，不要一律当 200 处理★**，body 里的 `code` 与 HTTP 状态通常一致：
+
+| HTTP 状态 | 含义 | 你该怎么做 |
+|------|------|------|
+| 200 | 成功（`code:0`）| 读 `data` |
+| **202** | **已受理，结果待定**（退款、删卡）| ★不是失败也不是成功★，见下方「异步受理」 |
+| 400 | 参数错误 / 业务失败 | 看 `error_code`，多为终态，别盲目重试 |
+| 401 | 密钥缺失 / 无效 / 已停用 | 检查 `X-API-Key` |
+| 403 | IP 不在白名单 / 未开通权限 / 未充值 / 子账户无权 | 看 `error_code` 区分，见附录 |
+| 404 | 对象不存在（订单、CDK 订单）| 确认 id 归属本密钥 |
+| 409 | 冲突（幂等键仍在处理中、订单已开始支付无法取消）| 退避后重查状态，别重复提交 |
+| 429 | 频率超限（默认 100 次/分钟/密钥）| 指数退避 |
+| 500 | 服务端错误 | 可重试；写操作重试务必带同一 `Idempotency-Key` |
+| 503 | 渠道暂时不可用（上游故障已熔断）| 稍后重试或换 `issuer` |
+
+### ★一律按 `error_code` 判断，不要匹配 `msg` 文案★
+
+`msg` 是给人看的中文说明，**会改**；`error_code` 是稳定的机器可读值。
+完整对照见 [附录 A：错误码](#附录-a错误码对照)。
+
+### ★异步受理（HTTP 202）：受理 ≠ 成功★
+
+**退款**和**删卡**可能返回 HTTP `202`，表示上游已受理但结果未确认：
+
+```jsonc
+{ "code": 0, "msg": "退款已提交，正在确认结果", "data": { "pending": true } }
+```
+
+- `data.pending == true` → 结果待定，**不要重复提交**，改为轮询卡列表 / 卡详情确认。
+- `data.pending == false`（HTTP 200）→ 已确认完成。
+- 系统会自动对账收口；重复提交可能造成重复操作。
+
+**直充下单**同理：`POST /gpt-direct/orders` 返回 HTTP `202` + `"msg":"accepted"`，
+只表示订单已入队，**不代表订阅已开通**，必须轮询订单状态到终态。
+
+> ★充值是例外★：卡充值结果未确认时返回的是 **HTTP 400** 加「充值结果确认中」类
+> 文案（不是 202），同样不要重复提交，等系统对账。
+
+### 两个不守规矩的响应（历史兼容，接入时请特判）
+
+| 接口 | 异常表现 |
+|---|---|
+| `GET /cards/{id}/openai-payments` | 卡不存在时返回 **HTTP 200**，但 body 是 `{"code":404,...}` |
+| `GET /balance-logs` | 筛选参数非法时返回 400，但**不带 `error_code`**，只有 `msg` |
+
+**常见业务错误（`msg` 文案示例）**：余额不足、卡产品不存在或已下架、最低开卡金额限制、卡不存在、卡状态异常无法操作、退款金额超出卡内余额、退款后卡内余额不得少于 $1 等。
+
+### 渠道暂时不可用（可编程区分）
+
+当某发卡渠道上游故障时，系统会探活确认后**临时熔断**该渠道，开卡 / 充值接口返回 **HTTP `503`**，body 带稳定的 `error_code`：
+
+```jsonc
+{ "code": 503, "error_code": "channel_unavailable", "msg": "渠道暂时不可用，请稍后再试或选择其他渠道" }
+```
+
+- 请按 `error_code == "channel_unavailable"` 判定（勿匹配 `msg` 文案），据此**稍后重试**或**改用其他渠道的产品**（不同 `issuer`）。
+- 渠道恢复后自动放开，无需人工介入；该状态只影响对应渠道，其他渠道正常。
+- 此为暂时性故障，非扣费失败——熔断拦截发生在扣费之前，不会产生扣款。
+
+
+---
+
+## 4. 幂等
+
+开卡、充值、退款等写操作，带一个唯一的 `Idempotency-Key` 头：
+
+```
+Idempotency-Key: 你的唯一订单号
+```
+
+同一密钥下、相同 `Idempotency-Key` 的请求只会真正执行一次；重试会**原样返回首次结果**（响应头带 `Idempotent-Replayed: true`），可避免网络重试导致**重复开卡 / 重复扣费**。
+
+---
+
+## 5. 数据字典
+
+**卡状态 `status`**
+
+| 状态 | 说明 |
+| --- | --- |
+| ACTIVE | 激活（正常使用）|
+| FROZEN | 已冻结 |
+| CANCELLED | 已注销 |
+| DELETED | 已删除 |
+
+**交易类型 `type`**
+
+| 类型 | 说明 |
+| --- | --- |
+| Authorization | 消费授权 |
+| Settlement | 清算 |
+| Refund | 消费退款 |
+| Reversal | 授权撤销 |
+
+**交易状态 `status`**
+
+| 状态 | 说明 |
+| --- | --- |
+| PENDING | 清算中 |
+| COMPLETE | 清算完成 |
+| DECLINED | 交易失败（失败原因见 `description`）|
+
+---
+
+
+## 6. CDK 接口详解
+
+> CDK 有三组互不相同的地址，**不可混用**：卡台所有者接口 `/openapi/v1`（服务端用 `X-API-Key`）；卡台公开兑换 `/api/v1/cdk`（凭完整码/令牌，绑定出口 IP 与设备）；你自托管的 CDK 站（你自己的域名，见 6.20）。沙盒仅用 `https://sandbox.zovocard.com` 与沙盒密钥、测试数据。下列相对路径若未写全，均以 `/openapi/v1` 为 Base。
+
+- 卡台所有者接口：`https://zovocard.com/openapi/v1`，服务端使用 `X-API-Key`。
+- 卡台公开兑换：`https://zovocard.com/api/v1/cdk`，凭码/令牌，绑定出口 IP 和设备。
+- 自托管 CDK 站：你自己的域名，完整路径见 §6.20。三组地址不可混用。
+- 沙盒仅使用 `https://sandbox.zovocard.com`、沙盒密钥与测试数据。
+
+### 6.18.6 发放和查询 CDK
 
 > **50x 套餐参数：`"plan": "pro_50x"`，产品为 `"product": "gpt"`。** 创建直充订单、发放 CDK 都使用这个值；请求字段是 `plan`，不是 `plan_type`。
 
-以下相對路徑以 `/openapi/v1` 為 Base，由接入方伺服器使用 API Key 呼叫。發碼時收服務費，兌換時的卡片注資與訂閱實付由 CDK 所有者承擔。費率讀取 `GET /gpt-direct/plans`，不要寫死為免費。
+以下相对路径以 `/openapi/v1` 为 Base，均由接入方服务端使用 API Key 调用。发码时扣服务费；兑换时的卡片注资与订阅实付由 CDK 所有者承担。金额以 `GET /gpt-direct/plans` 的账户实时配置为准，不固定为免费。
 
 `POST /gpt-direct/cdks`：
 
@@ -19,102 +203,146 @@
 {"plan":"plus","count":2,"funding_confirmed":true,"payment_country":"PH"}
 ```
 
-| 欄位 | 要求與含義 |
+| 字段 | 要求与含义 |
 | --- | --- |
-| `plan` | 必填。`go`、`plus`、`pro_5x`、`pro_20x`、`pro_50x`、`pro_20x_renew`、`credit250`、`credit500`、`credit1000`、`credit2500`、`credit5000`、`credit25000`，並須仍可購買 |
-| `count` | 預設1，建議1–200；單次最多 **200** 張 |
-| `funding_confirmed` | 必須為 `true`，確認由所有者承擔兌換資金 |
-| `payment_country` | 可選 PH / US / JP / CL / EG；依 `/gpt-direct/plans` 的 `payment_regions`，省略預設 PH |
-| `payment_currency` | 可省略，由平台按國家補齊；明確提供時須相符 |
-| `preferred_issuer` / `preferred_segment_type` / `preferred_segment_key` | 購碼展示快照；**不綁定卡片，也不決定日後兌換選卡** |
+| `plan` | 必填。当前 CDK 档位为 `go`、`plus`、`plus_half`、`pro_5x`、`pro_20x`、`pro_50x`、`pro_20x_renew`、`pro_5x_renew`、`credit250`、`credit500`、`credit1000`、`credit2500`、`credit5000`、`credit25000`，还须处于可售状态 |
+| `count` | 默认 1，建议传 1–200；单次最多 **200** 张 |
+| `funding_confirmed` | 必须为 `true`，确认由所有者承担兑换资金 |
+| `payment_country` | 可选，PH / US / JP / CL / EG；以 `/gpt-direct/plans` 的 `payment_regions` 为准，省略默认 PH |
+| `payment_currency` | 可省略，由平台根据国家补齐；显式提供时必须与国家匹配 |
+| `preferred_issuer` / `preferred_segment_type` / `preferred_segment_key` | 可选的购码展示快照；**不绑定银行卡，也不决定之后兑换时的选卡** |
 
-- 同一事務內整批成功或整批回滾。成功回傳 `data.requested`、`data.issued[]`；每項含 `id/code/code_prefix/plan/fee_amount_minor`（USD 分）。
-- 發碼帶唯一 `Idempotency-Key`，重試保持原鍵和參數；結果不明先查庫存，不換鍵重買。
-- 保存完整 `code`；所有者清單也回傳資料庫保留的明文，極早期僅存雜湊的碼可能沒有。不能用前綴兌換，也不要限制碼長度；新舊碼均相容。
-- 發碼請求**沒有**可寫 `owner_funding_cap_minor` 參數，新購碼不設硬上限；舊碼按現有授權執行，`preview.funding_cap_minor=0` 表示未設上限。
-- `pro_20x_renew` 僅為符合資格的 Pro 20x 帳號綁續費卡，本次不扣訂閱款，未來帳單仍需卡內足夠餘額。點數檔需已有有效 Plus/Pro；仍須通過預檢。
+- 本次发码在同一事务内完成：整批成功或整批回滚，不再逐张部分成功。成功返回 `data.requested`、`data.issued[]`，每项含 `id`、`code`、`code_prefix`、`plan`、`fee_amount_minor`（USD 分）。
+- 带唯一 `Idempotency-Key`，网络重试保留原请求和原键；结果不确定先查列表，不能用新键重复购码。
+- 保存完整 `code`；所有者列表也会返回库中保存的明文 `code`，极早期只有哈希的码可能无此字段。不要用 `code_prefix` 兑换，不要限制码长度；新码和历史码都支持。
+- 当前发码请求**没有** `owner_funding_cap_minor` 可写参数，新购码不设置硬上限。已有码的授权仍按库内配置执行，`preview.funding_cap_minor=0` 表示未设上限。
+- `pro_20x_renew` 是续费绑卡档：当前账号须符合 Pro 20x 续费条件，本次绑定不发起订阅扣款，未来账单由所绑卡支付，须留足余额。`pro_5x_renew` 同理，适用于 Pro 5x 账号。点数档需已有有效 Plus/Pro；预检仍会校验账号资格。
 
-| 方法與路徑 | 用法與回應 |
+| 方法与路径 | 用法与响应 |
 | --- | --- |
-| `GET /gpt-direct/cdks` | `page/page_size`（預設20、最多200）、`status/plan/q`；回傳 `data.list/total`。可見本 Key 發碼與官網購入未綁 App 的碼 |
-| `POST /gpt-direct/cdks/{id}/disable` | 停用自己帳戶的未使用碼；回傳 `data.id/status`，不退發碼費 |
-| `POST /gpt-direct/cdks/{id}/enable` | 恢復自己帳戶可啟用的碼為 `unused` |
-| `POST /gpt-direct/cdks/batch-disable` | `{"ids":[101,102]}`，最多100；回傳 `data.disabled/failed` ID 陣列及計數 |
-| `POST /gpt-direct/cdks/batch-enable` | 同上，成功陣列及計數為 `enabled/enabled_count` |
+| `GET /gpt-direct/cdks` | `page`、`page_size`（默认20，最大200）、`status`、`plan`、`q`；返回 `data.list`、`data.total`。可见本 Key 签发的码及官网购买未绑定 App 的码 |
+| `POST /gpt-direct/cdks/{id}/disable` | 停用自己账户的未使用码；成功返回 `data.id/status`，不退发码服务费 |
+| `POST /gpt-direct/cdks/{id}/enable` | 恢复自己账户可启用的码为 `unused` |
+| `POST /gpt-direct/cdks/batch-disable` | `{"ids":[101,102]}`，最多100个；`data.disabled`、`data.failed` 为 ID 数组，另有两个计数字段 |
+| `POST /gpt-direct/cdks/batch-enable` | 同上，成功数组/计数改为 `enabled` / `enabled_count` |
 
-批量啟停逐項處理，200不代表全部成功，須檢查 `failed`。清單/訂單按 Key/App 可見範圍過濾，啟停按帳戶歸屬校驗，同帳戶不同 Key 不是啟停權限隔離邊界。
+批量启停逐项处理，HTTP 200 不代表全部成功；检查 `failed`。列表与订单按 Key/App 可见范围过滤，启停接口按账户所有权校验，不能将同账户不同 Key 当成启停权限隔离边界。
 
-CDK 狀態：`unused` 可兌換，`reserved` 已關聯處理中訂單，`consumed` 已消耗，`review` 保留待核驗，`frozen` 暫時凍結，`disabled` 已停用。
+CDK 状态：`unused` 可兑换，`reserved` 已关联进行中的订单，`consumed` 已消耗，`review` 保留待核验，`frozen` 暂时冻结，`disabled` 已停用。
 
-#### 6.18.7 CDK 訂單對賬
+#### 自定义 CDK 品牌前缀
 
-- `GET /gpt-direct/cdk-orders?page=1&page_size=20` 返回當前 Key 可見 CDK 的兌換訂單（本 Key 簽發 + 官網購入未綁定 App）。
-- `GET /gpt-direct/cdk-orders/{order_id}` 返回單筆訂單與公開時間線 `events`。
+在「我的 CDK → CDK 品牌前缀」保存品牌缩写，或由服务端调用以下接口。账号须已开通 GPT 直充权限，并满足该账号的充值及子账号权限要求；不需要调用支付上游。
 
-列表支持 `updated_after`（RFC3339）、`status`、`cdk_id`、`order_id`、`page` 和 `page_size`（最大 100）。結果包括 CDK 前綴/狀態、脫敏賬號與卡號、金額、服務費/資金狀態、訂單階段和時間；不返回憑據、代理、內部排障詳情、完整 CDK 或完整卡號。同一用戶的其他 API Key 簽發 CDK 的訂單不可見。官網購入碼的兌換 Webhook 不會推到後建的 Key，請用本接口對賬。
+| 方法与完整路径 | 用途 |
+| --- | --- |
+| `GET /openapi/v1/gpt-direct/cdk-branding` | 查询当前账号的品牌前缀及各套餐格式预览 |
+| `PUT /openapi/v1/gpt-direct/cdk-branding` | 保存当前账号的品牌前缀 |
 
-#### 6.18.8 CDK 兌換（公開兌換接口，獨立於 API Key）
+两者均使用 `X-API-Key`。PUT 正文示例：
 
-Base 為 `https://zovocard.com/api/v1/cdk`，無需 API Key，憑完整有效碼獲取短期會話。四步須保持相同出口 IP 與 `X-Redemption-Device`；未傳時使用 `User-Agent`。
+```json
+{"brand_prefix":"UUU"}
+```
 
-公開接口按 IP 限流：preview 每分鐘30次、redeem 20次、result 60次；預檢另有限制，遇429須退避。
+成功返回 `code=0`；`data` 包含 `brand_prefix`、`plan_labels` 和 `examples`。例如 `plan_labels.plus="PLUS"`、`examples.plus="UUUPLUS-XXXXXXXXXX-XXXXXXXXXX"`；X 仅为预览占位，不能兑换。
 
-**非同步受理（2026-09-24）**：訂單、CDK預留、預檢消耗與查詢會話一起提交後即回應，由背景繼續選卡、注資和付款。沿用 HTTP 200、`code=0`、`data.id`，不要求改接202。新單初始為 `status=awaiting_card`、`stage=cdk_accepted`；`card_id` 可能省略/為0，請持續查詢結果。重啟後會由持久化訂單恢復。
+- 前缀限 1–8 位 ASCII 英文字母或数字，首位须为字母，自动转为大写；不支持空格、连字符或 HTML。传 `{"brand_prefix":""}` 恢复默认；字段不能省略或为 null。格式错误返回 HTTP 400、`error_code=cdk_brand_prefix_invalid`。
+- 填 `UUU` 后：Plus 为 `UUUPLUS-…`，Pro 5x 为 `UUU5X-…`，Pro 20x 为 `UUU20X-…`，Pro 50x 为 `UUU50X-…`；续费绑卡档为 `UUU20XRENEW-…`，Go 为 `UUUGO-…`，点数档为 `UUUC250-…` / `UUUC500-…` / `UUUC1000-…`。随机部分仍为两段各 10 位十六进制字符。
+- 设置作用于账号之后的网页单张/批量购码、API 发码及管理员给该账号发码。同账号的 API Key 共用，主子账号独立；不接收 `user_id/owner_id/api_key_id` 等代设参数。发码请求仍使用原参数，不要在购码请求中添加 `brand_prefix`。
+- 未设置或清空后仍生成原 `ZC-…` 格式。修改只影响新码，已发出的所有码保留原样，继续按原套餐兑换。套餐判断以响应中的 `plan` 为准，勿从前缀推断；`code_prefix` 只是截取片段，不能用于兑换。请保存并原样提交完整 `code`，不要限定固定前缀或长度。
+- PUT 可使用现有 `Idempotency-Key`；重试保留原键及正文，修改另一份设置须使用新键。保存设置本身不收费，也不会发码、兑换或退款。
 
-重試須保留原 `redemption_token/preflight_token/client_request_id` 及選卡參數；相同請求回傳原訂單，改參數回傳409 `IDEMPOTENCY_CONFLICT`。受理不等於付款成功，背景發現餘額/授權不足仍會在狀態和事件說明。
+确认付款（包括卡流水纠正为已付款）后，CDK核销为 `consumed`，不可再次兑换、重新启用或删除退费。执行中的单次尝试失败不代表整单失败；订单仍在处理或已提交待确认时，应继续查询原订单，不要重新兑换。
+
+### 6.18.7 CDK 订单对账
+
+- `GET /gpt-direct/cdk-orders?page=1&page_size=20` 返回当前 Key 可见 CDK 的兑换订单（本 Key 签发 + 官网购入未绑定 App）。
+- `GET /gpt-direct/cdk-orders/{order_id}` 返回单笔订单与公开时间线 `events`。
+
+列表支持 `updated_after`（RFC3339）、`status`、`cdk_id`、`order_id`、`page` 和 `page_size`（最大 100）。结果包括 CDK 前缀/状态、脱敏账号与卡号、金额、服务费/资金状态、订单阶段和时间；不返回凭据、代理、内部排障详情、完整 CDK 或完整卡号。同一用户的其他 API Key 签发 CDK 的订单不可见。官网购入码的兑换 Webhook 不会推到后建的 Key，请用本接口对账。
+
+
+CDK订单列表和详情均返回 `renewal_status`（2026-09-25新增），与付款的 `status` 分开判断。`success` 表示系统已记录续费取消成功；`pending/retrying` 表示仍在处理；`warning/manual_required` 需要复查或人工处理；`not_requested` 表示该订单没有要求取消（例如 `pro_20x_renew` 续费绑卡需要保留自动续费）。空值表示未知，不能当作成功。订单 `completed` 后仍可继续只读查询此字段，不要因等待取消结果而重新兑换或重复付款；查询本身不触发新的取消请求。
+
+### 6.18.8 CDK 兑换（公开兑换接口，独立于 API Key）
+
+公开兑换 Base 为 `https://zovocard.com/api/v1/cdk`，无需 API Key，凭完整有效码获取短期兑换会话。四步必须使用同一出口 IP 和同一 `X-Redemption-Device`；未带此头时采用 `User-Agent`。
+
+公开接口限流按 IP：preview 30次/分钟、redeem 20次/分钟、result 60次/分钟；预检另有频率限制，遇429须退避。
+
+**异步受理（2026-09-24）**：自动选卡兑换在订单、CDK预留、预检消耗及查询会话一起落库后返回，选卡、注资和付款由后台继续执行。保持原接口的 HTTP 200、`code=0`、`data.id`，不要求接入方切换为202。新单初始 `status=awaiting_card`、`stage=cdk_accepted`，表示已受理；`card_id` 此时可能缺省/为0，须继续查询结果。进程重启后由持久化订单恢复处理。
+
+网络重试必须保留原 `redemption_token`、`preflight_token`、`client_request_id` 和选卡参数；同一请求返回原订单，变更参数返回409 `IDEMPOTENCY_CONFLICT`。受理成功不等于支付成功，后台发现余额/授权不足时仍会通过订单状态和事件告知。
 
 ```json
 {"code":0,"msg":"ok","data":{"id":456,"status":"awaiting_card","stage":"cdk_accepted","async_card_selection":true}}
 ```
 
 
-| 步驟 | 方法與完整路徑 | 請求與結果 |
+| 步骤 | 方法与完整路径 | 请求与结果 |
 | --- | --- | --- |
-| 1. 預覽 | `POST /api/v1/cdk/preview` | `{"code":"<完整CDK>"}` → `data.redemption_token/expires_at/plan/plan_flow/funding_cap_minor`，會話15分鐘有效 |
-| 2. 預檢 | `POST /api/v1/cdk/preflight` | `redemption_token` + `credential` → `data.preflight_token/preflight_expires_at`、資格與報價；採用碼內付款地區 |
-| 3. 兌換 | `POST /api/v1/cdk/redeem` | `redemption_token/preflight_token/client_request_id` → `data.id/status/stage` |
-| 4. 查結果 | `GET /api/v1/cdk/result?token=<redemption_token>` | `data.order/events`，須符合原 IP/設備綁定 |
+| 1. 预览 | `POST /api/v1/cdk/preview` | `{"code":"<完整CDK>"}` → `data.redemption_token`、`expires_at`、`plan`、`plan_flow`、`funding_cap_minor`；会话15分钟有效 |
+| 2. 预检 | `POST /api/v1/cdk/preflight` | `redemption_token` + `credential` → `data.preflight_token`、`preflight_expires_at`、账号资格与报价；使用码上保存的付款地区 |
+| 3. 兑换 | `POST /api/v1/cdk/redeem` | `redemption_token` + `preflight_token` + `client_request_id` → `data.id/status/stage`；Grok / Claude 码改传 `credential`（见下） |
+
+> **Grok / Claude 码**：这两个产品的预检只查账号状态、**不返回 `preflight_token`**。兑换时不传 `preflight_token`，改传与预检相同的 `credential`（`{"mode":"session","session":"<grok.com 的 sso cookie 或 Claude sk>"}`）；缺少时返回 `CREDENTIAL_REQUIRED`。GPT / X 码仍必须传 `preflight_token`，缺少时返回 `PREFLIGHT_REQUIRED`。重试须带同一账号，换账号视为改参数（409 `IDEMPOTENCY_CONFLICT`）。开放 API 兑换（`/openapi/v1/gpt-direct/cdks/redeem`）规则相同。发 Grok 码：`plan` 传 `grok_` 前缀档位（如 `grok_premium_monthly`，见 `GET /gpt-direct/plans?product=grok`），须 Grok 全局开关已开且档位可购买。Grok 必须带 `grok_` 前缀：裸 `premium_monthly` 不会按 Grok 发码。
+>
+> **2026-10-19 Grok 档位改名**（对齐 x.ai Plus / Premium / Super / Ultra）：旧键 `grok_lite_*` / `grok_monthly` / `grok_yearly` / `grok_heavy_*` 仍可传，自动换成 `grok_plus_*` / `grok_premium_*` / `grok_ultra_*`。★但 `grok_plus_monthly` / `grok_plus_yearly` 现在是 $8 的 Grok Plus★；原 $100 档（旧 `grok_plus_*`）已改为 `grok_super_monthly` / `grok_super_yearly`，原来用 `grok_plus_*` 发 $100 码的须改传 `grok_super_*`。
+
+> **Grok 半价 CDK（严格档）**：发码用半价键 `grok_premium_monthly_half` / `grok_super_monthly_half` / `grok_ultra_monthly_half`（仅 Premium / Super / Ultra 月付）。严格语义：兑换时**硬性要求**上游首月折扣存在；若不存在（促销失效、或该档此刻无折扣），兑换在**扣款前失败**（`grok_half_ineligible`），**绝不回落正价**——因此发给顾客的半价 CDK 不会被意外按正价扣款。无需特殊标记，半价 plan key 本身携带该行为。（普通 `grok_*` 码不变：有首月折扣自动享，否则正价。）
+
+| 4. 查结果 | `GET /api/v1/cdk/result?token=<redemption_token>` | `data.order` + `data.events`；同样受原 IP/设备绑定限制 |
+
+预检请求示例：
 
 ```json
 {"redemption_token":"<preview token>","credential":{"mode":"session","session":"<customer session>"}}
 ```
 
-第三步不重傳憑據。可選 `exclude_card_ids` 排除本單選卡、`strict_card_preference=true` 不追加平台後備卡段、`no_auto_card_switch=true` 禁止本單自動換卡。自動選卡依卡主**當前用卡規則**，未配置則依平台預設，不讀購碼 `preferred_*` 快照。
+第三步不重复传凭据。可选 `exclude_card_ids` 排除本单自动选择的卡，`strict_card_preference=true` 不追加平台后备卡段，`no_auto_card_switch=true` 关闭本单失败后自动换卡。自动选卡读取卡主**当前用卡规则**，没有规则时用平台默认，发码时的 `preferred_*` 不锁定兑换选择。
 
-指定既有卡須使用 §6.18.8a；公開入口收到非零 `card_id` 回傳403 `CARD_SELECTION_REQUIRES_API_KEY`。
+需要指定原卡时使用 §6.18.8a 的所有者接口；本公开入口收到非零 `card_id` 返回 `403 CARD_SELECTION_REQUIRES_API_KEY`。
 
-`queued/awaiting_card/funding_pending/dispatching/running/requires_action/pending/plus_paid` 及各種 review 均須繼續查詢，不重新付款。`completed` 表示該套餐流程完成，續費綁卡不代表下期帳單已扣。`declined/failed_precharge/cancelled` 雖為訂單終態，仍須核對 `cdk_status/funding_hold_status/service_fee_status` 與事件，**不能直接推斷已退錢或釋放碼**；僅 `unused` 可再次兌換，有扣款證據或結果不明可能保留 `review`。
+订单进入 `queued`、`awaiting_card`、`funding_pending`、`dispatching`、`running`、`requires_action`、`pending`、`plus_paid` 或各类 review 时继续查询，不重新付款。`completed` 表示该套餐流程完成，续费绑卡档不等于下一期账单已扣款。`declined` / `failed_precharge` / `cancelled` 是订单终态，但**不能单凭失败状态推断码已释放或钱已退**；所有者还应核对 `cdk_status`、`funding_hold_status`、`service_fee_status` 和事件。只有 CDK 回到 `unused` 才能再次兑换；有扣款证据或不确定时可能继续保留为 `review`。
 
-公開結果包含 `data.order.card_id/card_last_four`。後四位可能為空且不唯一，不應用它判斷訂單成敗。API Key 與完整 Session 不得放在網頁原始碼或日誌。
+公开结果新增 `data.order.card_id`、`card_last_four`；后四位可能为空，不能据此推断失败，也不能用后四位唯一识别卡。API Key 和完整 Session 不得暴露在页面源码或日志中。
 
-#### 6.18.8a 兌換時指定既有銀行卡（所有者 API）
+### 6.18.8a 兑换时指定已有银行卡（所有者 API）
 
-`POST /openapi/v1/gpt-direct/cdks/redeem` 以卡主 API Key 鑑權，兌換已購 CDK，不重收 CDK 服務費。購碼、發碼、持碼均不綁卡。
+`POST /openapi/v1/gpt-direct/cdks/redeem` 使用卡主的 API Key 鉴权。与普通直充 `/orders` 不同，此接口兑换已购买的 CDK，不再收取一遍 CDK 服务费。
 
-所有者兌換未傳 `card_id` 時同樣非同步受理；明確指定卡仍先校驗並鎖定該卡，不會改為自動選卡。
+不传 `card_id` 的所有者兑换也采用上述异步受理；显式指定卡仍先校验该卡并锁定用卡，不会改为自动选择。
 
-接入方須由**服務端**先呼叫公開 `/api/v1/cdk/preview`、`/preflight`，再以相同出口 IP 與 `X-Redemption-Device` 呼叫此接口，勿把 API Key 放入終端網頁。僅可兌換本賬戶、本 Key 簽發或官網購入未綁 App 的碼。
+先由接入方**服务端**依次调用上文公开 `/api/v1/cdk/preview`、`/preflight`，再在同一出口 IP、同一 `X-Redemption-Device` 下调用本接口。API Key 不得放入终端网页。CDK 必须属于当前账户，且为本 Key 签发或官网购入未绑定 App 的码；不能兑换同账户其它 Key 的码。
 
 ```json
-{"redemption_token":"<preview>","preflight_token":"<preflight>","client_request_id":"redeem-example-001","card_id":123}
+{
+  "redemption_token": "<preview 返回值>",
+  "preflight_token": "<preflight 返回值>",
+  "client_request_id": "redeem-example-001",
+  "card_id": 123
+}
 ```
 
-- `card_id` 是可選的本地卡 ID；省略/0 維持自動選卡。傳入即鎖定，失敗不自動換卡、不另開卡，重試也不能更換。
-- 卡須屬於 CDK 所有者、ACTIVE、未過期，無在途充值/退款/銷卡，並符合用量、冷卻、歸檔、渠道與續費獨占限制。
-- 卡餘額不足時僅按原注資規則補入指定卡，受所有者資金授權、CDK 上限與可用餘額約束；不退其它卡籌款。
-- 同卡再次主動充值不等於自動續費，訂閱資格及 `pro_20x_renew` 獨占限制不變。選卡校驗失敗不消耗 CDK/預檢；結果不確定時維持對賬。
-- 幂等使用必填 `client_request_id`；CDK、卡、預檢令牌或選卡參數變更回 `409 IDEMPOTENCY_CONFLICT`。此接口不使用通用 `Idempotency-Key` 回應快取。
-- `exclude_card_ids`、`strict_card_preference`、`no_auto_card_switch` 可選；指定卡與排除清單衝突會拒絕，不能設 false 解除指定卡鎖定。
+- `card_id` 可选，使用平台本地卡 ID；不传或为 0 时保持自动选卡。购码、发码与持有码不绑定卡。
+- 指定后锁定本单用卡，强制禁止自动换卡/另开新卡。不能以重试或“改自动开卡”替换这张卡。
+- 卡必须属于 CDK 所有者、ACTIVE、有效期正常，且无在途充值/退款/销卡；继续执行使用次数、冷却、归档、渠道及续费独占校验。
+- 所选卡余额不足时，按既有注资规则仅为该卡补款，受 CDK 所有者资金授权、额度上限和账户可用余额限制。不会退款其它卡来凑钱，也不会偷偷改用另一张卡。
+- 同卡复用不等于自动续费；套餐仍有效等订阅资格限制不变，`pro_20x_renew` 的独占卡限制不放宽。
+- 选卡失败时建单事务回滚，不消耗 CDK/预检。资金结果未知时保持待对账，勿重建订单。
+- 幂等以必填 `client_request_id` 为准：重试需保留 CDK、卡、预检令牌和选卡参数；改变参数返回 `409 IDEMPOTENCY_CONFLICT`。本接口不使用通用 `Idempotency-Key` 响应缓存。
+- 可选 `exclude_card_ids`、`strict_card_preference`、`no_auto_card_switch` 与公开入口语义一致；指定卡若同时在排除列表中会明确拒绝，指定卡不能通过 `no_auto_card_switch=false` 解除锁定。
 
-返回 `data.order`（`order_id`、`card_id`、`card_last_four`、狀態與資金狀態）及 `data.events`；亦可用 §6.18.7 查詢。公開 `/api/v1/cdk/result` 新增 `order.card_id` / `order.card_last_four`，不洩漏完整卡號/CVV。
+返回 `data.order`（含 `order_id`、`card_id`、`card_last_four`、状态和资金状态）及 `data.events`。后续可通过 §6.18.7 订单接口查询。公开 `/api/v1/cdk/result` 也返回 `order.card_id` / `order.card_last_four`，不返回完整卡号/CVV。
 
-明確錯誤包括 `CARD_NOT_FOUND`、`CARD_NOT_PAYABLE`、`CARD_EXPIRED`、`CARD_DETAILS_UNAVAILABLE`、`CARD_FUNDING_BUSY`、`CARD_IN_USE`、`CARD_CAPACITY_REACHED`、`CARD_CAPACITY_PRO20`、`CARD_RENEWAL_BOUND`、`CARD_COOLING_DOWN`、`CARD_PLAN_UNSUPPORTED`、`CARD_SELECTION_LOCKED`。公開 `/api/v1/cdk/redeem` 不接受指定卡，回 `403 CARD_SELECTION_REQUIRES_API_KEY`。
+常见拒绝码：`CARD_NOT_FOUND`、`CARD_NOT_PAYABLE`、`CARD_EXPIRED`、`CARD_DETAILS_UNAVAILABLE`、`CARD_FUNDING_BUSY`、`CARD_IN_USE`、`CARD_CAPACITY_REACHED`、`CARD_CAPACITY_PRO20`、`CARD_RENEWAL_BOUND`、`CARD_COOLING_DOWN`、`CARD_PLAN_UNSUPPORTED`、`CARD_SELECTION_LOCKED`。公开 `/api/v1/cdk/redeem` 收到非零 `card_id` 返回 `403 CARD_SELECTION_REQUIRES_API_KEY`，不会静默忽略。
 
-**參數與呼叫順序**
+**参数与接入顺序**
 
-`redemption_token/preflight_token/client_request_id` 必填，請求編號為 1–80 位元組（建議使用 ASCII）。`card_id` 是正整數的**本地卡 ID**，不是完整卡號、後四位或上游字串 ID；可保存上次 `cdk-orders/{order_id}` 的 `order.card_id`，或查自己卡片清單。
+`redemption_token`、`client_request_id` 必填；GPT / X 码另须 `preflight_token`，Grok / Claude 码另须 `credential`；请求编号为 1–80 字节（建议使用 ASCII）。`card_id` 是正整数的**本地卡 ID**，不是完整卡号、卡后四位或上游字符串 ID。可从上次 `cdk-orders/{order_id}` 的 `order.card_id` 保存，也可从本人卡列表取得。
 
-以下由服務端依序呼叫，把前一步的令牌帶入下一步，出口 IP/設備保持一致。購買、生成 CDK 不傳 `card_id`。
+下面四次调用都由接入方服务端完成；把前一步返回的令牌填入后一步，保持出口 IP/设备标识一致。购买或生成 CDK 时不传 `card_id`。
 
 ```bash
 # Server-side only. Set these variables privately; never ship the key to a browser.
@@ -138,7 +366,7 @@ curl --fail-with-body "$ZOVOCARD_ORIGIN/openapi/v1/gpt-direct/cdk-orders/456" \
   -H "X-API-Key: $ZOVOCARD_API_KEY"
 ```
 
-成功回應示例（僅主要欄位；HTTP 200 是建單成功，**尚非充值完成**）：
+成功响应示例（只列主要字段，HTTP 200 表示建单成功，**不是已经充值成功**）：
 
 ```json
 {
@@ -159,57 +387,57 @@ curl --fail-with-body "$ZOVOCARD_ORIGIN/openapi/v1/gpt-direct/cdk-orders/456" \
 }
 ```
 
-保存 `data.order.order_id/card_id/card_last_four`，待終態確認實際用卡；不回傳完整 PAN/CVV。卡不能用時不得自行改為 `card_id=0` 或普通直充單。
+保存 `data.order.order_id`、`card_id`、`card_last_four`，在终态确认实际用卡。`data.order` 不含完整 PAN/CVV。卡不能用时不得自行改成 `card_id=0` 或改走普通直充订单，否则会改变用户的指定卡意图。
 
-| HTTP / error_code | 處理方式 |
+| HTTP / error_code | 处理方式 |
 | --- | --- |
-| 409 `IDEMPOTENCY_CONFLICT` | 原編號已綁其它參數，先查原單，不用新編號繞過不明結果 |
-| 403 `CDK_NOT_ACCESSIBLE` | 核對所有者、Key/App |
-| 400 `REDEMPTION_SESSION_INVALID` | 核對有效期、出口 IP、設備；先確認舊單未建立，再重新預覽/預檢 |
-| 400 `CDK_UNAVAILABLE` | 已使用或兌換中，查原單 |
-| 400 `CARD_*` / `REDEMPTION_REJECTED` | 按原因處理卡狀態、額度、冷卻或資金授權，不自動換卡 |
+| 409 `IDEMPOTENCY_CONFLICT` | 请求号已绑定另一组兑换参数；先查原订单，不要用新编号绕过结果不明的请求 |
+| 403 `CDK_NOT_ACCESSIBLE` | 检查所有者及签发 Key/App 是否匹配 |
+| 400 `REDEMPTION_SESSION_INVALID` | 检查令牌有效期、出口 IP、设备；先确认旧请求未建单，再重新预览/预检 |
+| 400 `CDK_UNAVAILABLE` | 码已使用或正在兑换，查询已有订单 |
+| 400 `CARD_*` 或 `REDEMPTION_REJECTED` | 按原因处理卡状态、归属、额度、冷却或资金授权；不要自动换卡 |
 
-平台繼續校驗鑑權/IP白名單/直充及子帳戶權限。接入方也須核實自己客戶的身份和可復用卡，不可信任瀏覽器任意傳入的卡 ID。舊服務404時先確認平台版本，不回退自動選卡。
+鉴权/IP白名单/直充权限/子账户权限仍由平台校验。接入方服务端也须核验自己客户的身份及允许复用的卡，不能仅凭浏览器传入的 `card_id` 授权。若旧版服务返回404，先确认平台已升级此接口，不要回退到自动选卡。
 
-#### 6.18.8b CDK 專案復用的卡台接口
+### 6.18.8b CDK 项目复用的卡台接口
 
-以下均在卡台 `/openapi/v1`，使用卡主 API Key。模板後台路由不是卡台開放 API。
+这些接口均在卡台 `/openapi/v1` 下，使用卡主 API Key。模板的后台管理路由不是卡台开放 API。
 
-| 方法與路徑 | 用途 |
+| 方法与路径 | 用途 |
 | --- | --- |
-| `GET /gpt-direct/plans` | 即時費率、可售套餐、付款地區（§6.18.2） |
-| `GET /balance` | 查 `spendable_balance` 可用餘額 |
-| `GET /gpt-direct/cdks` | 按 `status/plan/q` 同步可見庫存碼（§6.18.6） |
-| `GET /gpt-direct/cdk-orders` | 按 `updated_after/status/cdk_id/order_id` 對帳，讀完分頁（§6.18.7） |
-| `GET /gpt-direct/cdk-orders/{order_id}` | 實際用卡、資金狀態與公開時間線 |
-| `GET /gpt-direct/card-products` | `enabled/suspended/channel_open/auto_open_allowed/usable` 卡頭狀態 |
-| `GET /gpt-direct/card-rules` | 讀取當前帳戶規則，可帶 `product=gpt` |
-| `PUT /gpt-direct/card-rules` | 保存帳戶規則，影響後續相關訂單，不僅單張碼（§6.18.5a） |
-| `GET /gpt-direct/cards/{id}/usage` | 復用前查看用量/佔用/冷卻；查詢不預留卡，兌換時再校驗 |
+| `GET /gpt-direct/plans` | 读取账户实时服务费、可售套餐与付款地区（§6.18.2） |
+| `GET /balance` | 读取可用余额，优先使用 `spendable_balance` |
+| `GET /gpt-direct/cdks` | 按状态/套餐/q同步自己可见的库存完整码（§6.18.6） |
+| `GET /gpt-direct/cdk-orders` | 按 `updated_after/status/cdk_id/order_id` 对账，翻完分页（§6.18.7） |
+| `GET /gpt-direct/cdk-orders/{order_id}` | 读取实际用卡、资金状态及公开时间线 |
+| `GET /gpt-direct/card-products` | 读取可选卡头及 `enabled/suspended/channel_open/auto_open_allowed/usable` |
+| `GET /gpt-direct/card-rules` | 读取当前账户用卡规则，可带 `product=gpt` |
+| `PUT /gpt-direct/card-rules` | 保存当前账户规则；影响后续相关订单，不是只影响某一张码（§6.18.5a） |
+| `GET /gpt-direct/cards/{id}/usage` | 选择原卡前查看用量、占用和冷却；查询不预留卡，兑换时再次校验 |
 
-### 6.20 自託管 CDK 專案的公開查詢接口
+### 6.20 自托管 CDK 项目的公开查询接口
 
-依 `zovo_card_cdk_auto` **v1.4.22** 原始碼核對。以下路由位於你自己的 CDK 網站，如 `https://cdk.example.com`，**不屬於**卡台 `/openapi/v1` 或卡台 `/api/v1/cdk/*`。
+以下按 `zovo_card_cdk_auto` **v1.4.22** 源码核对，仅属于你部署的 CDK 站，例如 `https://cdk.example.com`。它们**不在** `https://zovocard.com/openapi/v1` 下，也不属于卡台的 `/api/v1/cdk/*` 路由。
 
-模板目前 `/api/v1/public/cdk/redeem` 仍轉發卡台公開兌換，尚未接所有者指定卡入口。僅加 `card_id` 不會生效，須由接入方伺服器按 §6.18.8a 適配。下列公開查詢不需卡台 API Key，但完整碼/Session 是敏感存取憑據。
+目前模板的 `/api/v1/public/cdk/redeem` 仍转发卡台公开兑换，尚未接入所有者指定卡接口。仅在模板请求里加 `card_id` 不会获得指定卡能力；需要接入方服务端按 §6.18.8a 适配。以下查询接口本身无需卡台 API Key，完整 CDK/Session 就是敏感访问凭据。
 
-| 方法與路徑 | 用途 |
+| 方法与路径 | 用途 |
 | --- | --- |
-| `GET /api/v1/public/cdk/plans` | 頂層 `source/plans/registry/version`；`cardplatform_live` 為即時，`docs_default/docs_default_fallback` 只供參考 |
-| `POST /api/v1/public/cdk/preview` | `{code}`，轉發卡台並保存本站碼與令牌綁定 |
-| `POST /api/v1/public/cdk/preflight` | 同卡台預檢，供本站保存Session綁定 |
-| `POST /api/v1/public/cdk/redeem` | 同公開兌換，本站可能附加排除卡與選卡策略 |
-| `GET /api/v1/public/cdk/result` | `?token=`，保持原 `X-Redemption-Device` |
-| `GET /api/v1/public/cdk/result-by-code` | `?code=`，相容 `cdk_code`；以本站綁定恢復進度，無綁定404，仍受 IP/設備限制 |
-| `GET /api/v1/lookup/cdk` | `?code=`，相容 `cdk_code`；本站狀態摘要，找不到404 |
-| `POST /api/v1/lookup/cdk/batch` | `{codes:[...]}` 或 `{text:"多行卡密"}`，去重後最多100；頂層 `total/max/results` |
-| `POST /api/v1/public/billing/check` | `{cdk_code}` 或 `{token_input}` / `{session}`；頂層 `summary/invoices/auth_source`，可能有 `invoice_url` |
+| `GET /api/v1/public/cdk/plans` | 返回顶层 `source/plans/registry/version`；`cardplatform_live` 为实时配置，`docs_default` / `docs_default_fallback` 仅参考，不可当实际售价 |
+| `POST /api/v1/public/cdk/preview` | `{code}`；代转卡台预览，并保存本站码与兑换令牌绑定 |
+| `POST /api/v1/public/cdk/preflight` | 同卡台预检请求；供本站恢复会话/账单绑定 |
+| `POST /api/v1/public/cdk/redeem` | 同卡台公开兑换；本站可能追加自己的排除卡/选卡策略 |
+| `GET /api/v1/public/cdk/result` | `?token=`，透传卡台结果；维持原 `X-Redemption-Device` |
+| `GET /api/v1/public/cdk/result-by-code` | `?code=`（兼容 `cdk_code`），按本站绑定恢复进度；未绑定404，仍受卡台 IP/设备限制 |
+| `GET /api/v1/lookup/cdk` | `?code=`（兼容 `cdk_code`），查本站记录，顶层返回状态摘要；找不到404 |
+| `POST /api/v1/lookup/cdk/batch` | `{codes:[...]}` 或 `{text:"多行卡密"}`，去重后最多100张；返回顶层 `total/max/results` |
+| `POST /api/v1/public/billing/check` | `{cdk_code}` 查本站绑定的Session，或 `{token_input}` / `{session}` 直接提交凭据；返回顶层 `summary/invoices/auth_source`，可能有 `invoice_url` |
 
-單碼摘要：`cdk_code/status/used/can_resubmit/message`，可選 `account_email/plan/used_at/notes`。常見 `unused/used/failed/disabled/expired/processing/unknown` 是本站摘要，**不是扣款對帳證據**；不能僅憑 `used=false` 重付。批量200也要逐項看結果，資金以卡台訂單與事件為準。
+单码摘要字段为 `cdk_code`、`status`、`used`、`can_resubmit`、`message`，以及可选 `account_email/plan/used_at/notes`。常见状态为 `unused/used/failed/disabled/expired/processing/unknown`；这是**本站摘要**，不是扣款对账凭证，不应只凭 `used=false` 判定可以重付。批量HTTP 200也要逐项看结果。资金结果以卡台订单及事件为准。
 
-`result-by-code` 保留卡台封裝，頂層另加 `cdk_code/redemption_token/has_session_binding`，有時附帳單鏈接；須檢查HTTP及原 `code`，不能看到令牌便判成功。帳單憑碼查詢需本站有效Session綁定，郵箱模式或別站兌換的碼不保證可查；無綁定404、輸入/憑據錯誤400。回應可能含完整郵箱、令牌，只交予有權持有碼或Session的使用者，不記公開日誌。
+`result-by-code` 的响应保留卡台结果封装，并在顶层追加 `cdk_code/redemption_token/has_session_binding`，有时会附账单链接；处理时同时检查HTTP 状态和原 `code`，不能看到令牌就认为成功。账单查询要求本站保存了有效Session，邮箱模式或其它站兑换的码不保证能查；无绑定404、无输入或凭据无效400。账单与摘要可能含完整邮箱，兑换结果可能含令牌：只交给有权持有码或Session的用户，不写公共日志。
 
-範例（`CDK_SITE` 為站主自己的域名）：
+示例（调用你自己的CDK域名；`CDK_SITE` 由站主提供）：
 
 ```bash
 curl --get "$CDK_SITE/api/v1/public/cdk/result-by-code" \
@@ -220,7 +448,7 @@ curl "$CDK_SITE/api/v1/public/billing/check" -H 'Content-Type: application/json'
   -d '{"cdk_code":"<full CDK>"}'
 ```
 
-兌換代理沿用 `code/msg/data`；查詢及帳單通常是頂層物件，本站錯誤一般為 `{error:...}`，不要一律只讀 `data`。`/api/v1/admin/*` 需要本站管理員JWT，不接受卡台API Key作為管理員憑據，不向終端使用者開放。
+这些接口响应并不统一：兑换代理保留卡台的 `code/msg/data`；查询/账单多为顶层对象，本站错误通常为 `{error:...}`。不要统一只读取 `data`。`/api/v1/admin/*` 需要本站管理员JWT，不能把卡台API Key当作管理员凭据，也不应向终端用户开放。
 
 
 ## 宽限期原订阅处理
@@ -228,8 +456,6 @@ curl "$CDK_SITE/api/v1/public/billing/check" -H 'Content-Type: application/json'
 预检返回 `subscription_recovery_required=true` 时，可让持码人确认取消宽限期原订阅（可能立即结束宽限期权益），再调用 `POST /api/v1/cdk/recover-subscription`。请求为 `{ "redemption_token": "...", "preflight_token": "...", "confirmed": true }`，沿用同一 `X-Redemption-Device` 和出口IP，无需API Key。
 
 成功响应 `data.status` 为 `cleared` 或 `pending`；`data.preflight`（如有）包含刷新后的账号状态和新 `preflight_token`。旧预检凭证已不可重复使用。只有确认原订阅已解除才显示可再次兑换；处理中或网络错误应重新检测，不能自动重发取消或自动兑换。正常有效订阅不支持此操作。这不是普通关闭自动续费，不消耗CDK、不创建订单。
-
-独立站浏览器使用本站 `/api/v1/public/cdk/recover-subscription` 转发同一请求；服务端不附加站点管理员API Key。部署顺序：ACC → 卡台 → 独立CDK站。
 
 
 ## Pro 50x：套餐参数与调用示例
@@ -265,7 +491,7 @@ curl "$CDK_SITE/api/v1/public/billing/check" -H 'Content-Type: application/json'
 
 请求头使用 `X-API-Key`、`Content-Type: application/json` 和唯一 `Idempotency-Key`。网络重试保留原幂等键与 `client_request_id`；HTTP 202 仅表示受理，继续查询该订单。
 
-**发放 50x CDK**：`POST /openapi/v1/gpt-direct/cdks`。`funding_confirmed=true` 表示码主承担兑换资金；兑换时套餐从 CDK 读取，不要把一张其他套餐的码在兑换请求里改成 50x。 使用自定义品牌前缀时，50x 后缀为 `50X`（例如 `UUU50X-…`）；套餐仍以接口 `plan` 为准。
+**发放 50x CDK**：`POST /openapi/v1/gpt-direct/cdks`。`funding_confirmed=true` 表示码主承担兑换资金；兑换时套餐从 CDK 读取，不要把一张其他套餐的码在兑换请求里改成 50x。
 
 ```json
 {
@@ -281,3 +507,30 @@ curl "$CDK_SITE/api/v1/public/billing/check" -H 'Content-Type: application/json'
 
 
 PH采集的50x免税价为PHP 29,008.93（2,900,893最小单位），含税展示价PHP 32,490。真实扣款以账号账单为准，服务费及开关读取套餐注册表。50x升级/非PH注资使用独立上限（默认USD 1,000，可配置），其他套餐原有上限不变。
+
+
+## 附录 A：CDK 错误码对照
+
+按 `error_code` 判断，不要匹配 `msg` 文案。限流一律 HTTP 429，须退避重试。
+
+| HTTP / error_code | 含义与处理 |
+| --- | --- |
+| 400 `cdk_brand_prefix_invalid` | 品牌前缀格式非法（1–8 位字母数字、首位字母）。改正后重试 |
+| 409 `IDEMPOTENCY_CONFLICT` | `client_request_id` 已绑定另一组兑换参数；先查原订单，勿用新编号绕过结果不明的请求 |
+| 403 `CDK_NOT_ACCESSIBLE` | 码不属于当前账户，或不是本 Key 签发 / 官网购入未绑定 App 的码 |
+| 400 `REDEMPTION_SESSION_INVALID` | 令牌过期、出口 IP 或设备不符；先确认旧请求未建单，再重新预览/预检 |
+| 400 `CDK_UNAVAILABLE` | 码已使用或正在兑换，查询已有订单，不要重兑 |
+| 403 `CARD_SELECTION_REQUIRES_API_KEY` | 公开兑换入口传了非零 `card_id`；指定卡请走所有者接口（6.18.8a）|
+| 400 `CARD_*` / `REDEMPTION_REJECTED` | 卡状态、归属、额度、冷却或资金授权问题；不要自动换卡 |
+
+> 失败终态（`declined` / `failed_precharge` / `cancelled`）**不能单独**推断码已释放或钱已退：还要核对 `cdk_status`、`funding_hold_status`、`service_fee_status` 和事件。只有 CDK 回到 `unused` 才能再次兑换。
+
+## 附录 B：接入自检清单
+
+- [ ] 发码、对账、指定卡兑换都在**服务端**用 `X-API-Key`，密钥绝不下发到浏览器或日志
+- [ ] 保存完整 `code`，不用 `code_prefix` 兑换，不限制码长度
+- [ ] 公开兑换四步（preview → preflight → redeem → result）用**同一出口 IP + 同一 `X-Redemption-Device`**
+- [ ] 幂等：发码带 `Idempotency-Key`，指定卡兑换用 `client_request_id`；重试保留原键与原参数，改参数返回 409
+- [ ] HTTP 200 / 受理 ≠ 支付成功；按订单 `status` + `cdk_status` + 事件对账，不重复兑换/付款
+- [ ] 套餐以响应里的 `plan` 为准，不从前缀推断；`pro_50x` 的套餐键是 `pro_50x`
+- [ ] 官网购入码的兑换 Webhook 不会推到后建的 Key，用 `GET /gpt-direct/cdk-orders` 对账

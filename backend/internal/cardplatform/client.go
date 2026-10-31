@@ -1,5 +1,5 @@
 // Package cardplatform 封装卡台 Open API + 公开 CDK 兑换接口。
-// 文档：docs/zovocard-cdk-zh.md、docs/zovocard-openapi-zh.md
+// 文档：docs/zovocard-cdk-zh.md、docs/zovocard-direct-zh.md、docs/zovocard-cards-zh.md
 package cardplatform
 
 import (
