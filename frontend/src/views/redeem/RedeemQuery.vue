@@ -87,7 +87,6 @@
       </div>
       <p class="rx-message">{{ basicMessage }}</p>
       <p v-if="basic.used_at" class="rx-message">完成时间：{{ basic.used_at }}</p>
-      <p class="rx-message" style="opacity: 0.7">详细进度只能在兑换时使用的浏览器中查看。</p>
       <div v-if="basic.status === 'failed' || basic.status === 'unused'" class="rx-next">
         <template v-if="basic.status === 'unused' || basic.can_resubmit">
           <strong>{{ basic.status === 'unused' ? '卡密还没有使用' : '原卡密仍可使用' }}</strong>
